@@ -7,19 +7,21 @@ transactions concurrently while preserving sequential semantics.
 
 ## The model
 
-Execution is parameterized by a read source: a `reader` answers the n-th
-fall-through read of a given address, with no consistency required between
-answers. Reading a fixed storage is one instance (`of_state`); torn views are
-other instances. One execution function, one replay lemma, and state-based
-speculation inside the quantification by construction.
+Execution is parameterized by two read sources: a `reader` answers the n-th
+fall-through storage read and a `breader` the n-th balance read, with no
+consistency required between answers. Reading a fixed storage and bank is
+one instance (`of_state`, `of_bank`); torn views are other instances. One
+execution function, one replay lemma, and state-based speculation inside
+the quantification by construction.
 
 The machine is contract storage, a bank, and a nonce map, typed apart:
 reads and writes touch storage; gas charging, coinbase crediting, and
-transfer settlement touch the bank; nothing else does. The language has
-reads, writes, events (`TEmit`), transfers (`TPay`), explicit revert, and
-state-dependent loops (`TWhile`); execution recurses on gas, so gas bounds
-unbounded iteration, and loop tests are logged, validated reads. Each block
-item carries a fee account, a gas limit, and a gas price. Below the cost
+transfer settlement touch the bank; balance reads (`TBal`) observe the
+bank; nothing else crosses. The language has reads, writes, balance reads,
+events (`TEmit`), transfers (`TPay`), explicit revert, and state-dependent
+loops (`TWhile`); execution recurses on gas, so gas bounds unbounded
+iteration, and loop tests are logged, validated reads. Each block item
+carries a fee account, a gas limit, and a gas price. Below the cost
 ceiling the transaction executes and pays for what it consumed, the payment
 is credited to the coinbase, declared transfers settle atomically against
 the prefix bank with insufficiency reverting the transaction, and the
@@ -27,9 +29,11 @@ sender's nonce advances; above it, the transaction is rejected untouched.
 Receipts distinguish completion, revert, and rejection, and carry gas
 consumed, committed writes, emitted events, and settled transfers.
 
-The merge validates each speculative read log against the merged prefix
-storage by value, commits agreeing outcomes unchanged, re-executes
-disagreeing ones. The scheduler `dispatch` runs transactions in an arbitrary
+The merge validates each speculative storage log against the merged prefix
+storage and each balance log against the merged prefix bank, by value,
+commits agreeing outcomes unchanged, re-executes disagreeing ones. A stale
+balance is therefore a conflict like a stale storage read, caught by the
+same mechanism. The scheduler `dispatch` runs transactions in an arbitrary
 order over a speculative machine evolving by the same gated step as the
 reference semantics, each transaction at most once.
 
@@ -63,16 +67,20 @@ the nonce ledger: an account's nonce advances by exactly its non-rejected
 transaction count.
 
 Conflict freedom: `disjoint_block_free`, derived from `valid_stable` and
-`commit_untouched`, proves a block with pairwise-disjoint footprints merges
-from base-state speculation without a single re-execution.
+`commit_untouched`, proves a block with pairwise-disjoint storage footprints
+and no balance reads merges from base-state speculation without a single
+re-execution; the exclusion is necessary, since gas moves the bank at every
+commit.
 
 Executable `Example`s compute the claims on concrete blocks: stale and
-torn-view conflicts detected and corrected with exact fees; the scheduler
-perfect in order and recovering out of order; transfers settling and
-insufficient transfers reverting yet paying gas; events in receipts and
-discarded on revert; nonces advancing; rejection observably distinct from
-revert; storage writes to the fee address buying nothing; a countdown loop
-ending in exactly its gas; a divergent loop burning out and paying.
+torn-view conflicts detected and corrected with exact fees; a stale balance
+read detected as a conflict and re-executed to the true balance, and
+validating under prefix-bank speculation; the scheduler perfect in order
+and recovering out of order; transfers settling and insufficient transfers
+reverting yet paying gas; events in receipts and discarded on revert;
+nonces advancing; rejection observably distinct from revert; storage writes
+to the fee address buying nothing; a countdown loop ending in exactly its
+gas; a divergent loop burning out and paying.
 
 ## Related work
 
@@ -89,12 +97,15 @@ speculation model wide enough to include inconsistent read views.
 ## Scope
 
 Validation is by value, so ABA passes and is proven harmless for every
-observable. Worker interleaving below transaction granularity and dependency
-estimation are not proof objects; the reader quantification covers what they
-can expose to reads, and the retry theorems cover their convergence
-obligation. Per-opcode gas costs are uniform; there are no refunds beyond
-charging only what was consumed, and no wall-clock claims beyond the work
-theorems.
+observable. Balance reads observe the prefix bank: a transaction's own gas
+and declared transfers settle at commit, so they are not visible to its own
+`TBal`, and nonces are not readable in-language, matching an instruction
+set with balance reads but no nonce read. Worker interleaving below
+transaction granularity and dependency estimation are not proof objects;
+the two read-source quantifications cover what they can expose to reads,
+and the retry theorems cover their convergence obligation. Per-opcode gas
+costs are uniform; there are no refunds beyond charging only what was
+consumed, and no wall-clock claims beyond the work theorems.
 
 ## Build
 
