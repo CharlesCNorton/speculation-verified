@@ -1,6 +1,6 @@
 # Outstanding work
 
-1. Rewrite the README to present `scheduler_correct` and `speculation_irrelevant` as the one-line corollaries of `optimistic_correct` they are, to describe `reexec_bound` as an aggregate bound, and to disclose in Scope the absence of contracts, calls, and reentrancy.
+1. Rewrite the README over the extended development: state the model, the theorem set, and the build, with Scope carrying only what the final artifact still excludes.
 2. Derive the hypotheses of `disjoint_block_free` from syntactic over-approximations, a no-`TBal` predicate and static read and write footprints, so conflict freedom is checkable without computing the runs it constrains.
 3. Extend `TBal` and `TPay` to an in-flight bank, deducting gas up front as the EVM does and settling transfers at the point of `TPay` with an observable outcome, and reprove the ledgers under it.
 4. Add QuickChick generators over random blocks and speculations to stress validation across the extended language beyond the hand-built examples.
