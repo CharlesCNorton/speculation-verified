@@ -6718,6 +6718,320 @@ Proof.
   pose proof (kdense_commits K acts HK Hd (length ts) Hlen). lia.
 Qed.
 
+(** ** The operational fast path
+
+    [trueout] is the outcome position [i] produces against its true prefix
+    machine.  When executed lower positions hold true outcomes, the
+    operational overlays reconstruct the true prefix exactly: storage
+    through the committed buffers, bank and nonces through the recorded
+    effects.  Executing every position in index order and then committing
+    the block therefore validates everywhere: the committed machine and
+    receipts are sequential execution's and not one position re-executes.
+    Admission of every position along the true sequence is assumed, since
+    an executed-but-rejected position's buffer is not part of the
+    sequential state. *)
+
+Definition trueout (m0 : mach) (ts : list item) (i : nat) : out :=
+  runt (nth i ts ditem)
+       (of_state (fst (fst (mach_at m0 ts i))))
+       (of_bank (snd (fst (mach_at m0 ts i))))
+       (of_nonces (snd (mach_at m0 ts i))).
+
+Lemma beff_step :
+  forall m0 ts j,
+    j < length ts ->
+    beff (nth j ts ditem) (trueout m0 ts j)
+         (snd (fst (mach_at m0 ts j)), snd (mach_at m0 ts j))
+    = (snd (fst (mach_at m0 ts (S j))), snd (mach_at m0 ts (S j))).
+Proof.
+  intros m0 ts j Hj.
+  rewrite (mach_at_S ts m0 j Hj).
+  unfold trueout.
+  destruct (mach_at m0 ts j) as [[stq bkq] nmq].
+  destruct (nth j ts ditem) as [[[[fee non] t] g] p].
+  cbn [fst snd].
+  unfold beff, step.
+  destruct (gateb bkq nmq (fee, non, t, g, p)) eqn:Hg.
+  - unfold finish. cbv zeta.
+    destruct (o_ok (runt (fee, non, t, g, p) (of_state stq) (of_bank bkq)
+                         (of_nonces nmq))) eqn:Hok; cbv beta iota;
+      cbn [fst snd]; reflexivity.
+  - cbn [fst snd]. reflexivity.
+Qed.
+
+Lemma obuf_trueout :
+  forall m0 ts s i cap,
+    i < length ts ->
+    os_out s i = Some (trueout m0 ts i, cap) ->
+    gateb (snd (fst (mach_at m0 ts i))) (snd (mach_at m0 ts i))
+          (nth i ts ditem) = true ->
+    obuf s i = cbuf m0 ts i.
+Proof.
+  intros m0 ts s i cap Hi Ho Hg.
+  unfold obuf, cbuf. rewrite Ho.
+  unfold trueout.
+  destruct (mach_at m0 ts i) as [[stq bkq] nmq].
+  destruct (nth i ts ditem) as [[[[fee non] t] g] p].
+  cbn [fst snd] in Hg.
+  unfold step. rewrite Hg.
+  unfold finish. cbv zeta.
+  destruct (o_ok (runt (fee, non, t, g, p) (of_state stq) (of_bank bkq)
+                       (of_nonces nmq))) eqn:Hok; cbv beta iota;
+    cbn [fst snd];
+    match goal with
+    | |- (if ?b then _ else _) = _ =>
+        first [ replace b with true by (symmetry; exact Hok)
+              | replace b with false by (symmetry; exact Hok) ]
+    end; reflexivity.
+Qed.
+
+Lemma ostor_go_true :
+  forall ts m0 s cnt from,
+    from + cnt <= length ts ->
+    (forall i, from <= i -> i < from + cnt -> obuf s i = cbuf m0 ts i) ->
+    forall k,
+      ostor_go (fst (fst (mach_at m0 ts from))) (obuf s) from cnt k
+      = fst (fst (mach_at m0 ts (from + cnt))) k.
+Proof.
+  intros ts m0 s cnt. induction cnt as [| c IH]; intros from Hle Hbuf k.
+  - rewrite Nat.add_0_r. reflexivity.
+  - cbn [ostor_go].
+    rewrite (Hbuf from ltac:(lia) ltac:(lia)).
+    rewrite <- (stor_mach_at_S ts m0 from ltac:(lia)).
+    replace (from + S c) with (S from + c) by lia.
+    apply IH; [lia |].
+    intros i Hi1 Hi2. apply Hbuf; lia.
+Qed.
+
+Lemma obknm_go_true :
+  forall ts m0 s cnt from,
+    from + cnt <= length ts ->
+    (forall i, from <= i -> i < from + cnt -> exists cap,
+        os_out s i = Some (trueout m0 ts i, cap)) ->
+    obknm_go ts s (snd (fst (mach_at m0 ts from)), snd (mach_at m0 ts from))
+             from cnt
+    = (snd (fst (mach_at m0 ts (from + cnt))),
+       snd (mach_at m0 ts (from + cnt))).
+Proof.
+  intros ts m0 s cnt. induction cnt as [| c IH]; intros from Hle Hout.
+  - rewrite Nat.add_0_r. reflexivity.
+  - cbn [obknm_go].
+    destruct (Hout from ltac:(lia) ltac:(lia)) as [cap Hof].
+    rewrite Hof.
+    rewrite (beff_step m0 ts from ltac:(lia)).
+    replace (from + S c) with (S from + c) by lia.
+    apply IH; [lia |].
+    intros i Hi1 Hi2. apply Hout; lia.
+Qed.
+
+Theorem op_overlay_true :
+  forall ts m0 s j,
+    os_c s = 0 -> os_m s = m0 -> j <= length ts ->
+    (forall i, i < j -> obuf s i = cbuf m0 ts i) ->
+    forall k, ostor s j k = fst (fst (mach_at m0 ts j)) k.
+Proof.
+  intros ts m0 s j Hc Hm Hj Hbuf k.
+  unfold ostor. rewrite Hc, Hm, Nat.sub_0_r.
+  exact (ostor_go_true ts m0 s j 0 ltac:(lia)
+           (ltac:(intros i Hi1 Hi2; apply Hbuf; lia)) k).
+Qed.
+
+Lemma exec_phase :
+  forall ts m0,
+    (forall i, i < length ts ->
+        gateb (snd (fst (mach_at m0 ts i))) (snd (mach_at m0 ts i))
+              (nth i ts ditem) = true) ->
+    forall j, j <= length ts ->
+    os_c (reach ts (oinit m0) (map AExec (seq 0 j))) = 0
+    /\ os_m (reach ts (oinit m0) (map AExec (seq 0 j))) = m0
+    /\ os_rs (reach ts (oinit m0) (map AExec (seq 0 j))) = []
+    /\ os_rx (reach ts (oinit m0) (map AExec (seq 0 j))) = 0
+    /\ (forall i, j <= i ->
+          os_out (reach ts (oinit m0) (map AExec (seq 0 j))) i = None)
+    /\ (forall i, i < j -> exists cap,
+          os_out (reach ts (oinit m0) (map AExec (seq 0 j))) i
+          = Some (trueout m0 ts i, cap)).
+Proof.
+  intros ts m0 Hgate j.
+  induction j as [| j IH]; intros Hj.
+  - refine (conj eq_refl (conj eq_refl (conj eq_refl (conj eq_refl
+              (conj _ _))))).
+    + intros i _. reflexivity.
+    + intros i Hi. lia.
+  - rewrite seq_S, map_app, reach_app.
+    destruct (IH ltac:(lia)) as (Hc & Hm & Hr & Hx & Hnone & Htrue).
+    set (sj := reach ts (oinit m0) (map AExec (seq 0 j))) in *.
+    assert (Hbuf : forall i, i < j -> obuf sj i = cbuf m0 ts i).
+    { intros i Hi.
+      destruct (Htrue i Hi) as [cap Hoi].
+      exact (obuf_trueout m0 ts sj i cap ltac:(lia) Hoi
+               (Hgate i ltac:(lia))). }
+    assert (Hov : forall k, ostor sj j k = fst (fst (mach_at m0 ts j)) k).
+    { apply op_overlay_true; try assumption. lia. }
+    assert (Hbk : obknm ts sj j
+                  = (snd (fst (mach_at m0 ts j)), snd (mach_at m0 ts j))).
+    { unfold obknm. rewrite Hc, Hm, Nat.sub_0_r.
+      exact (obknm_go_true ts m0 sj j 0 ltac:(lia)
+               (ltac:(intros i Hi1 Hi2; apply Htrue; lia))). }
+    assert (Hrun : runt (nth j ts ditem)
+                     (of_state (ostor sj j))
+                     (of_bank (fst (obknm ts sj j)))
+                     (of_nonces (snd (obknm ts sj j)))
+                   = trueout m0 ts j).
+    { unfold trueout. symmetry.
+      destruct (nth j ts ditem) as [[[[fee non] t] g] p].
+      unfold runt. cbv beta iota zeta.
+      apply replay.
+      - intros k v Hin.
+        assert (Hv : ostor sj j k = v).
+        { refine (valid_true_In _ (ostor sj j) _ k v Hin).
+          apply valid_self_s. }
+        rewrite <- Hv. exact (eq_sym (Hov k)).
+      - intros a v Hin.
+        assert (Hv : fst (obknm ts sj j) a = v).
+        { refine (bvalid_true_In _ (fst (obknm ts sj j)) _ a v Hin).
+          apply bvalid_self_b. }
+        rewrite <- Hv. rewrite Hbk. reflexivity.
+      - intros a v Hin.
+        assert (Hv : snd (obknm ts sj j) a = v).
+        { refine (bvalid_true_In _ (snd (obknm ts sj j)) _ a v Hin).
+          pose proof (nvalid_self_n g (g - c_base C) fee t
+                        (of_state (ostor sj j))
+                        (of_bank (fst (obknm ts sj j)))
+                        (snd (obknm ts sj j)) 0 0 0 [] zerof
+                        (deb0 fee (g * (BF + p))) [] (aacc0 fee)) as Hn.
+          unfold nvalid in Hn. exact Hn. }
+        rewrite <- Hv. rewrite Hbk. reflexivity. }
+    cbn [map reach fold_left Nat.add].
+    cbn [ostep].
+    assert (Hguard : (os_c sj <=? j) && (j <? length ts) = true).
+    { rewrite Hc. cbn. apply Nat.ltb_lt. lia. }
+    rewrite Hguard.
+    assert (Hn : nth_error ts j = Some (nth j ts ditem))
+      by (apply nth_error_nth'; lia).
+    rewrite Hn.
+    cbn [os_c os_m os_rs os_rx os_out].
+    refine (conj Hc (conj Hm (conj Hr (conj Hx (conj _ _))))).
+    + intros i Hi. cbn beta.
+      destruct (i =? j) eqn:He.
+      * apply Nat.eqb_eq in He. lia.
+      * apply Hnone. lia.
+    + intros i Hi. cbn beta.
+      destruct (i =? j) eqn:He.
+      * apply Nat.eqb_eq in He. subst i.
+        exists (ostamp sj j).
+        rewrite Hrun. reflexivity.
+      * apply Htrue. apply Nat.eqb_neq in He. lia.
+Qed.
+
+Lemma commit_phase :
+  forall ts m0 cnt s,
+    oinv m0 ts s ->
+    os_c s + cnt = length ts ->
+    (forall i, os_c s <= i -> i < length ts -> exists cap,
+        os_out s i = Some (trueout m0 ts i, cap)) ->
+    os_c (reach ts s (repeat ACommit cnt)) = length ts
+    /\ os_rx (reach ts s (repeat ACommit cnt)) = os_rx s.
+Proof.
+  intros ts m0 cnt. induction cnt as [| c IH]; intros s Hinv Hlen Hout.
+  - cbn. split; [lia | reflexivity].
+  - cbn [repeat reach fold_left].
+    pose proof Hinv as [Hc [Hm [Hr [Houti Hstamp]]]].
+    assert (Hstep1 : os_c (ostep ts s ACommit) = S (os_c s)
+                     /\ os_rx (ostep ts s ACommit) = os_rx s
+                     /\ (forall i, os_out (ostep ts s ACommit) i
+                                   = os_out s i)).
+    { cbn [ostep].
+      assert (Hb : (os_c s <? length ts) = true)
+        by (apply Nat.ltb_lt; lia).
+      rewrite Hb.
+      assert (Hn : nth_error ts (os_c s) = Some (nth (os_c s) ts ditem))
+        by (apply nth_error_nth'; lia).
+      rewrite Hn.
+      destruct (os_m s) as [[st bk] nm] eqn:EOM.
+      assert (HmS : mach_at m0 ts (os_c s) = (st, bk, nm))
+        by (symmetry; exact Hm).
+      destruct (nth (os_c s) ts ditem) as [[[[fee non] t] g] p] eqn:EN.
+      destruct (Hout (os_c s) ltac:(lia) ltac:(lia)) as [cap Hoc].
+      rewrite Hoc.
+      destruct (vercheck (o_slog (trueout m0 ts (os_c s))) cap (os_stamp s)
+                && bvalid bk (o_blog (trueout m0 ts (os_c s)))
+                && nvalid nm (o_nlog (trueout m0 ts (os_c s)))
+                && gateb bk nm (fee, non, t, g, p)) eqn:HA.
+      - destruct (finish st bk nm fee g p (trueout m0 ts (os_c s)))
+          as [m1 r].
+        cbn. split; [reflexivity |]. split; [reflexivity |].
+        intros i. reflexivity.
+      - destruct (gateb bk nm (fee, non, t, g, p)) eqn:Hg.
+        + assert (Hvchk : vcheck st bk nm (trueout m0 ts (os_c s)) = true).
+          { unfold trueout. rewrite EN, HmS. cbn [fst snd].
+            unfold vcheck, runt. cbv beta iota zeta.
+            rewrite valid_self_s, bvalid_self_b, nvalid_self_n.
+            reflexivity. }
+          destruct (cstep (st, bk, nm) (fee, non, t, g, p)
+                      (Some (trueout m0 ts (os_c s)))) as [[m1 r] fl]
+            eqn:EC.
+          unfold cstep in EC. rewrite Hg, Hvchk in EC.
+          injection EC as EC1 EC2.
+          rewrite <- EC2.
+          cbn. split; [reflexivity |]. split; [reflexivity |].
+          intros i. reflexivity.
+        + cbn. split; [reflexivity |]. split; [reflexivity |].
+          intros i. reflexivity. }
+    destruct Hstep1 as (H1c & H1x & H1o).
+    assert (Hout1 : forall i, os_c (ostep ts s ACommit) <= i ->
+               i < length ts -> exists cap,
+               os_out (ostep ts s ACommit) i = Some (trueout m0 ts i, cap)).
+    { intros i Hi1 Hi2. rewrite H1o. apply Hout; [| exact Hi2].
+      rewrite H1c in Hi1. lia. }
+    destruct (IH (ostep ts s ACommit) (ostep_inv ts m0 s ACommit Hinv)
+                ltac:(rewrite H1c; lia) Hout1) as [IHc IHx].
+    split; [exact IHc |].
+    rewrite <- H1x. exact IHx.
+Qed.
+
+Theorem op_fast_path :
+  forall ts m0,
+    (forall i, i < length ts ->
+        gateb (snd (fst (mach_at m0 ts i))) (snd (mach_at m0 ts i))
+              (nth i ts ditem) = true) ->
+    os_c (reach ts (oinit m0)
+            (map AExec (seq 0 (length ts)) ++ repeat ACommit (length ts)))
+    = length ts
+    /\ os_m (reach ts (oinit m0)
+              (map AExec (seq 0 (length ts))
+               ++ repeat ACommit (length ts)))
+      = fst (seq_execr m0 ts)
+    /\ os_rs (reach ts (oinit m0)
+               (map AExec (seq 0 (length ts))
+                ++ repeat ACommit (length ts)))
+      = snd (seq_execr m0 ts)
+    /\ os_rx (reach ts (oinit m0)
+               (map AExec (seq 0 (length ts))
+                ++ repeat ACommit (length ts)))
+      = 0.
+Proof.
+  intros ts m0 Hgate.
+  destruct (exec_phase ts m0 Hgate (length ts) (le_n _))
+    as (Hc & Hm & Hr & Hx & Hnone & Htrue).
+  set (se := reach ts (oinit m0) (map AExec (seq 0 (length ts)))) in *.
+  assert (Hinv : oinv m0 ts se)
+    by (apply reach_inv; apply oinit_inv).
+  destruct (commit_phase ts m0 (length ts) se Hinv
+              ltac:(rewrite Hc; lia)
+              ltac:(intros i Hi1 Hi2; exact (Htrue i Hi2)))
+    as [Hfc Hfx].
+  assert (Hdone : os_c (reach ts (oinit m0)
+                     (map AExec (seq 0 (length ts))
+                      ++ repeat ACommit (length ts))) = length ts)
+    by (rewrite reach_app; exact Hfc).
+  destruct (op_safety ts m0 _ Hdone) as [Hsm Hsr].
+  split; [exact Hdone |].
+  split; [exact Hsm |].
+  split; [exact Hsr |].
+  rewrite reach_app. fold se. rewrite Hfx. exact Hx.
+Qed.
+
 (* __SENTINEL__ *)
 
 End Machine.
