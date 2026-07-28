@@ -28,6 +28,7 @@
 (******************************************************************************)
 
 From Stdlib Require Import List Arith Bool Lia Permutation NArith Wf_nat.
+From Stdlib Require Import OrderedType OrderedTypeEx FMapAVL FMapFacts.
 Import ListNotations.
 
 (** ** Storage keys, bank, nonces
@@ -331,6 +332,112 @@ Record out : Type := Out {
   o_acc  : list key;
   o_aacc : list addr
 }.
+
+(** ** Balanced maps
+
+    The engine at the end of the file runs on AVL maps rather than
+    function-typed states.  Storage keys are ordered lexicographically;
+    account maps are keyed by address.  Both wrappers delete a binding
+    when the written value is zero, so a map's support never accumulates
+    dead entries and dumping a state lists only nonzero bindings. *)
+
+Module Key_as_OT <: OrderedType.
+  Definition t := key.
+  Definition eq (a b : t) : Prop := a = b.
+  Definition lt (a b : t) : Prop :=
+    fst a < fst b \/ (fst a = fst b /\ snd a < snd b).
+  Lemma eq_refl : forall x : t, eq x x.
+  Proof. intro x. reflexivity. Qed.
+  Lemma eq_sym : forall x y : t, eq x y -> eq y x.
+  Proof. intros x y H. symmetry. exact H. Qed.
+  Lemma eq_trans : forall x y z : t, eq x y -> eq y z -> eq x z.
+  Proof. intros x y z H1 H2. rewrite H1. exact H2. Qed.
+  Lemma lt_trans : forall x y z : t, lt x y -> lt y z -> lt x z.
+  Proof.
+    unfold lt. intros x y z [H1 | [H1a H1b]] [H2 | [H2a H2b]];
+      [left | left | left | right]; try split; lia.
+  Qed.
+  Lemma lt_not_eq : forall x y : t, lt x y -> ~ eq x y.
+  Proof.
+    unfold lt, eq. intros x y H E. subst y.
+    destruct H as [H | [_ H]]; lia.
+  Qed.
+  Definition compare : forall x y : t, Compare lt eq x y.
+  Proof.
+    intros [a1 b1] [a2 b2].
+    destruct (lt_eq_lt_dec a1 a2) as [[Hlt | Heq] | Hgt].
+    - apply LT. left. cbn. exact Hlt.
+    - destruct (lt_eq_lt_dec b1 b2) as [[Hlt' | Heq'] | Hgt'].
+      + apply LT. right. cbn. auto.
+      + apply EQ. subst. reflexivity.
+      + apply GT. right. cbn. auto.
+    - apply GT. left. cbn. exact Hgt.
+  Defined.
+  Definition eq_dec : forall x y : t, {eq x y} + {~ eq x y}.
+  Proof.
+    intros x y. destruct (keqb x y) eqn:He.
+    - left. apply keqb_eq. exact He.
+    - right. intro E. apply keqb_neq in He. exact (He E).
+  Defined.
+End Key_as_OT.
+
+Module SM := FMapAVL.Make Key_as_OT.
+Module AM := FMapAVL.Make Nat_as_OT.
+Module SF := FMapFacts.Facts SM.
+Module AF := FMapFacts.Facts AM.
+
+Definition smap : Type := SM.t nat.
+Definition amap : Type := AM.t nat.
+
+Definition slookA (m : smap) (k : key) : val :=
+  match SM.find k m with Some v => v | None => 0 end.
+
+Definition supdA (m : smap) (k : key) (v : val) : smap :=
+  if v =? 0 then SM.remove k m else SM.add k v m.
+
+Definition alookA (m : amap) (a : addr) : nat :=
+  match AM.find a m with Some v => v | None => 0 end.
+
+Definition aupdA (m : amap) (a : addr) (v : nat) : amap :=
+  if v =? 0 then AM.remove a m else AM.add a v m.
+
+Lemma slookA_supdA :
+  forall m k v k',
+    slookA (supdA m k v) k' = if keqb k' k then v else slookA m k'.
+Proof.
+  intros m k v k'. unfold slookA, supdA.
+  destruct (keqb k' k) eqn:He.
+  - apply keqb_eq in He. subst k'.
+    destruct (v =? 0) eqn:Hz.
+    + apply Nat.eqb_eq in Hz.
+      rewrite SF.remove_eq_o by reflexivity. lia.
+    + rewrite SF.add_eq_o by reflexivity. reflexivity.
+  - apply keqb_neq in He.
+    destruct (v =? 0).
+    + rewrite SF.remove_neq_o by (intro E; exact (He (eq_sym E))).
+      reflexivity.
+    + rewrite SF.add_neq_o by (intro E; exact (He (eq_sym E))).
+      reflexivity.
+Qed.
+
+Lemma alookA_aupdA :
+  forall m a v a',
+    alookA (aupdA m a v) a' = if a' =? a then v else alookA m a'.
+Proof.
+  intros m a v a'. unfold alookA, aupdA.
+  destruct (a' =? a) eqn:He.
+  - apply Nat.eqb_eq in He. subst a'.
+    destruct (v =? 0) eqn:Hz.
+    + apply Nat.eqb_eq in Hz.
+      rewrite AF.remove_eq_o by reflexivity. lia.
+    + rewrite AF.add_eq_o by reflexivity. reflexivity.
+  - apply Nat.eqb_neq in He.
+    destruct (v =? 0).
+    + rewrite AF.remove_neq_o by (intro E; exact (He (eq_sym E))).
+      reflexivity.
+    + rewrite AF.add_neq_o by (intro E; exact (He (eq_sym E))).
+      reflexivity.
+Qed.
 
 Section Machine.
 
@@ -7030,6 +7137,208 @@ Proof.
   split; [exact Hsm |].
   split; [exact Hsr |].
   rewrite reach_app. fold se. rewrite Hfx. exact Hx.
+Qed.
+
+(** ** Engine
+
+    The engine reruns the machine on AVL maps: storage keyed by ordered
+    pairs, bank and nonces keyed by address, every write deleting its
+    binding on zero.  Admission, validation, and execution are the shared
+    [gateb], [vcheck], and [runt] applied at the viewed map state, so the
+    engine routes through the same validate-or-re-execute step as the
+    merge; only the state application is map-level.  [runp_rd_ext] carries
+    pointwise reader agreement through the executor, which lets every
+    engine theorem transport from the functional machine. *)
+
+Lemma runp_rd_ext :
+  forall rd rd' brd brd' nrd nrd',
+    (forall n k, rd n k = rd' n k) ->
+    (forall n a, brd n a = brd' n a) ->
+    (forall n a, nrd n a = nrd' n a) ->
+    forall f gas cur t n bn nn w cred deb acc aacc,
+      runp f gas cur t rd brd nrd n bn nn w cred deb acc aacc
+      = runp f gas cur t rd' brd' nrd' n bn nn w cred deb acc aacc.
+Proof.
+  intros rd rd' brd brd' nrd nrd' Hr Hb Hn.
+  induction f as [| f' IH]; intros gas cur t n bn nn w cred deb acc aacc.
+  - destruct t; reflexivity.
+  - destruct t as [| rv | | a v k | a k | a k | a k | a tst tb k | e k
+                   | d amt k | c arg amt k];
+      simpl; rewrite ?Hr, ?Hb, ?Hn; rewrite ?IH; rsplit;
+      rewrite ?Hr, ?Hb, ?Hn; rewrite ?IH; reflexivity.
+Qed.
+
+Lemma runt_rd_ext :
+  forall i rd rd' brd brd' nrd nrd',
+    (forall n k, rd n k = rd' n k) ->
+    (forall n a, brd n a = brd' n a) ->
+    (forall n a, nrd n a = nrd' n a) ->
+    runt i rd brd nrd = runt i rd' brd' nrd'.
+Proof.
+  intros [[[[fee non] t] g] p] rd rd' brd brd' nrd nrd' Hr Hb Hn.
+  cbn [runt]. apply runp_rd_ext; assumption.
+Qed.
+
+Lemma valid_ext :
+  forall log (s s' : storage),
+    (forall k, s' k = s k) -> valid s' log = valid s log.
+Proof.
+  induction log as [| [k v] r IH]; simpl; intros s s' H.
+  - reflexivity.
+  - rewrite H, (IH s s' H). reflexivity.
+Qed.
+
+Lemma bvalid_ext :
+  forall log (b b' : bank),
+    (forall a, b' a = b a) -> bvalid b' log = bvalid b log.
+Proof.
+  induction log as [| [a v] r IH]; simpl; intros b b' H.
+  - reflexivity.
+  - rewrite H, (IH b b' H). reflexivity.
+Qed.
+
+(** Engine state, viewed state, and the map-level state application. *)
+
+Definition machA : Type := (smap * amap * amap)%type.
+
+Definition mview (mf : machA) : mach :=
+  (slookA (fst (fst mf)), alookA (snd (fst mf)), alookA (snd mf)).
+
+Definition mAeq (mf : machA) (m : mach) : Prop :=
+  (forall k, slookA (fst (fst mf)) k = fst (fst m) k)
+  /\ (forall a, alookA (snd (fst mf)) a = snd (fst m) a)
+  /\ (forall a, alookA (snd mf) a = snd m a).
+
+Lemma mAeq_view : forall mf, mAeq mf (mview mf).
+Proof.
+  intro mf. refine (conj _ (conj _ _)); intros; reflexivity.
+Qed.
+
+Definition commitA (sf : smap) (w : buffer) : smap :=
+  fold_right (fun p sf' => supdA sf' (fst p) (snd p)) sf w.
+
+Fixpoint apply_tvsA (bf : amap) (l : list transfer) : amap :=
+  match l with
+  | [] => bf
+  | (s, d, amt) :: r =>
+      apply_tvsA (aupdA (aupdA bf s (alookA bf s - amt)) d
+                        (alookA (aupdA bf s (alookA bf s - amt)) d + amt)) r
+  end.
+
+Definition finishA (stf : smap) (bkf nmf : amap)
+                   (fee : addr) (g p : nat) (o : out) : machA * rcpt :=
+  let u := g - o_gas o in
+  if o_ok o
+  then
+    let u_eff := u - Nat.min (o_ref o) (u / 2) in
+    let b1 := aupdA bkf fee (alookA bkf fee - g * (BF + p)) in
+    let b2 := apply_tvsA b1 (o_tvs o) in
+    let b3 := aupdA b2 fee (alookA b2 fee + (g - u_eff) * (BF + p)) in
+    let b4 := aupdA b3 CB (alookA b3 CB + u_eff * p) in
+    ((commitA stf (o_buf o), b4, aupdA nmf fee (S (alookA nmf fee))),
+     (SOk, u_eff, o_buf o, o_evs o, o_tvs o))
+  else
+    ((stf, aupdA (aupdA bkf fee (alookA bkf fee - u * (BF + p))) CB
+                 (alookA (aupdA bkf fee (alookA bkf fee - u * (BF + p))) CB
+                  + u * p),
+      aupdA nmf fee (S (alookA nmf fee))),
+     (SRev, u, [], [], [])).
+
+Definition stepA (mf : machA) (i : item) : machA * rcpt :=
+  let '(stf, bkf, nmf) := mf in
+  if gateb (alookA bkf) (alookA nmf) i
+  then
+    let '(fee, non, t, g, p) := i in
+    finishA stf bkf nmf fee g p
+      (runt i (of_state (slookA stf)) (of_bank (alookA bkf))
+              (of_nonces (alookA nmf)))
+  else (mf, rejrcpt).
+
+Definition cstepA (mf : machA) (i : item) (oo : option out)
+  : (machA * rcpt) * bool :=
+  let '(stf, bkf, nmf) := mf in
+  if gateb (alookA bkf) (alookA nmf) i
+  then
+    match oo with
+    | Some o =>
+        if vcheck (slookA stf) (alookA bkf) (alookA nmf) o
+        then let '(fee, non, t, g, p) := i in
+             (finishA stf bkf nmf fee g p o, false)
+        else (stepA mf i, true)
+    | None => (stepA mf i, false)
+    end
+  else ((mf, rejrcpt), false).
+
+(** Pointwise simulation of the state application. *)
+
+Lemma aupdA_sim :
+  forall bf (b : bank) a0 vf v,
+    (forall a, alookA bf a = b a) -> vf = v ->
+    forall a, alookA (aupdA bf a0 vf) a = bupd b a0 v a.
+Proof.
+  intros bf b a0 vf v H Hv a. subst vf.
+  rewrite alookA_aupdA. unfold bupd.
+  destruct (a =? a0); [reflexivity | apply H].
+Qed.
+
+Lemma commitA_sim :
+  forall w sf (s : storage),
+    (forall k, slookA sf k = s k) ->
+    forall k, slookA (commitA sf w) k = commit s w k.
+Proof.
+  induction w as [| [k0 v0] r IH]; simpl; intros sf s Hag k.
+  - apply Hag.
+  - rewrite slookA_supdA. unfold kupd.
+    destruct (keqb k k0); [reflexivity | apply IH; exact Hag].
+Qed.
+
+Lemma apply_tvsA_sim :
+  forall l bf (b : bank),
+    (forall a, alookA bf a = b a) ->
+    forall a, alookA (apply_tvsA bf l) a = apply_tvs b l a.
+Proof.
+  induction l as [| [[s d] amt] r IH]; simpl; intros bf b Hag a.
+  - apply Hag.
+  - apply IH. intro a'.
+    rewrite !alookA_aupdA. unfold bupd. rewrite !Hag. reflexivity.
+Qed.
+
+Lemma finishA_sim :
+  forall stf bkf nmf (st : storage) (bk : bank) (nm : nonces) fee g p o,
+    (forall k, slookA stf k = st k) ->
+    (forall a, alookA bkf a = bk a) ->
+    (forall a, alookA nmf a = nm a) ->
+    mAeq (fst (finishA stf bkf nmf fee g p o))
+         (fst (finish st bk nm fee g p o))
+    /\ snd (finishA stf bkf nmf fee g p o) = snd (finish st bk nm fee g p o).
+Proof.
+  intros stf bkf nmf st bk nm fee g p o Hst Hbk Hnm.
+  unfold finishA, finish.
+  pose proof (aupdA_sim _ _ fee _ _ Hnm (f_equal S (Hnm fee))) as Hn'.
+  destruct (o_ok o).
+  - pose proof (aupdA_sim _ _ fee _ _ Hbk
+                  (f_equal2 Nat.sub (Hbk fee)
+                     (eq_refl (g * (BF + p))))) as Hb1.
+    pose proof (apply_tvsA_sim (o_tvs o) _ _ Hb1) as Hb2.
+    pose proof (aupdA_sim _ _ fee _ _ Hb2
+                  (f_equal2 Nat.add (Hb2 fee)
+                     (eq_refl ((g - (g - o_gas o
+                                     - Nat.min (o_ref o) ((g - o_gas o) / 2)))
+                               * (BF + p))))) as Hb3.
+    pose proof (aupdA_sim _ _ CB _ _ Hb3
+                  (f_equal2 Nat.add (Hb3 CB)
+                     (eq_refl ((g - o_gas o
+                                - Nat.min (o_ref o) ((g - o_gas o) / 2))
+                               * p)))) as Hb4.
+    exact (conj (conj (commitA_sim (o_buf o) _ _ Hst) (conj Hb4 Hn'))
+                eq_refl).
+  - pose proof (aupdA_sim _ _ fee _ _ Hbk
+                  (f_equal2 Nat.sub (Hbk fee)
+                     (eq_refl ((g - o_gas o) * (BF + p))))) as Hb1.
+    pose proof (aupdA_sim _ _ CB _ _ Hb1
+                  (f_equal2 Nat.add (Hb1 CB)
+                     (eq_refl ((g - o_gas o) * p)))) as Hb2.
+    exact (conj (conj Hst (conj Hb2 Hn')) eq_refl).
 Qed.
 
 (* __SENTINEL__ *)
