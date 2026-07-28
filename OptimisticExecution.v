@@ -29,6 +29,7 @@
 
 From Stdlib Require Import List Arith Bool Lia Permutation NArith Wf_nat.
 From Stdlib Require Import OrderedType OrderedTypeEx FMapAVL FMapFacts.
+From Stdlib Require Import SetoidList.
 Import ListNotations.
 
 (** ** Storage keys, bank, nonces
@@ -7581,6 +7582,138 @@ Proof.
   destruct Hm as (Ha & Hb & Hc).
   rewrite (asum_ext A _ _ Hb).
   exact Hs.
+Qed.
+
+(** ** Persistence
+
+    A state is dumped as the association lists of its three maps and
+    reloaded by inserting them in order.  Reloading restores every lookup,
+    so a dumped state and its reload are indistinguishable to the engine:
+    running a block from the reload yields the same receipts and the same
+    final lookups. *)
+
+Definition dumpS (m : smap) : list (key * nat) := SM.elements m.
+
+Definition loadS (l : list (key * nat)) : smap :=
+  fold_right (fun p m => SM.add (fst p) (snd p) m) (SM.empty nat) l.
+
+Definition dumpA (m : amap) : list (addr * nat) := AM.elements m.
+
+Definition loadA (l : list (addr * nat)) : amap :=
+  fold_right (fun p m => AM.add (fst p) (snd p) m) (AM.empty nat) l.
+
+Lemma loadS_cons :
+  forall p l, loadS (p :: l) = SM.add (fst p) (snd p) (loadS l).
+Proof. reflexivity. Qed.
+
+Lemma loadA_cons :
+  forall p l, loadA (p :: l) = AM.add (fst p) (snd p) (loadA l).
+Proof. reflexivity. Qed.
+
+Lemma in_inA_S :
+  forall (l : list (key * nat)) k v,
+    In (k, v) l -> InA (@SM.eq_key_elt nat) (k, v) l.
+Proof.
+  induction l as [| [k0 v0] r IH]; cbn; intros k v H.
+  - contradiction.
+  - destruct H as [He | H].
+    + injection He as -> ->. left.
+      cbv [SM.eq_key_elt Key_as_OT.eq]. cbn [fst snd].
+      split; reflexivity.
+    + right. apply IH. exact H.
+Qed.
+
+Lemma in_inA_A :
+  forall (l : list (addr * nat)) a v,
+    In (a, v) l -> InA (@AM.eq_key_elt nat) (a, v) l.
+Proof.
+  induction l as [| [a0 v0] r IH]; cbn; intros a v H.
+  - contradiction.
+  - destruct H as [He | H].
+    + injection He as -> ->. left.
+      cbv [AM.eq_key_elt]. cbn [fst snd]. split; reflexivity.
+    + right. apply IH. exact H.
+Qed.
+
+(** Loading gives the first binding a key has in the list, which is what
+    [find] reads off a map's own association list. *)
+
+Lemma loadS_findA :
+  forall l k, SM.find k (loadS l) = @findA SM.E.t nat (SF.eqb k) l.
+Proof.
+  induction l as [| [k0 v0] r IH]; intros k.
+  - unfold loadS. cbn [fold_right]. apply SF.empty_o.
+  - rewrite loadS_cons. cbn [fst snd findA]. unfold SF.eqb.
+    destruct (SM.E.eq_dec k k0) as [He | He].
+    + assert (Hkk : k = k0) by exact He. subst k0.
+      rewrite SF.add_eq_o by reflexivity. reflexivity.
+    + rewrite SF.add_neq_o by (intro Hq; apply He; exact (eq_sym (Hq : k0 = k))).
+      apply IH.
+Qed.
+
+Lemma loadA_findA :
+  forall l a, AM.find a (loadA l) = @findA AM.E.t nat (AF.eqb a) l.
+Proof.
+  induction l as [| [a0 v0] r IH]; intros a.
+  - unfold loadA. cbn [fold_right]. apply AF.empty_o.
+  - rewrite loadA_cons. cbn [fst snd findA]. unfold AF.eqb.
+    destruct (AM.E.eq_dec a a0) as [He | He].
+    + assert (Haa : a = a0) by exact He. subst a0.
+      rewrite AF.add_eq_o by reflexivity. reflexivity.
+    + rewrite AF.add_neq_o by (intro Hq; apply He; exact (eq_sym (Hq : a0 = a))).
+      apply IH.
+Qed.
+
+Lemma load_dump_S : forall m k, slookA (loadS (dumpS m)) k = slookA m k.
+Proof.
+  intros m k. unfold slookA, dumpS.
+  rewrite loadS_findA. rewrite <- SF.elements_o. reflexivity.
+Qed.
+
+Lemma load_dump_A : forall m a, alookA (loadA (dumpA m)) a = alookA m a.
+Proof.
+  intros m a. unfold alookA, dumpA.
+  rewrite loadA_findA. rewrite <- AF.elements_o. reflexivity.
+Qed.
+
+Definition dumpM (mf : machA)
+  : list (key * nat) * list (addr * nat) * list (addr * nat) :=
+  (dumpS (fst (fst mf)), dumpA (snd (fst mf)), dumpA (snd mf)).
+
+Definition loadM
+  (d : list (key * nat) * list (addr * nat) * list (addr * nat)) : machA :=
+  (loadS (fst (fst d)), loadA (snd (fst d)), loadA (snd d)).
+
+Theorem persistence_roundtrip :
+  forall mf, mAeq (loadM (dumpM mf)) (mview mf).
+Proof.
+  intros [[stf bkf] nmf].
+  refine (conj _ (conj _ _)); intro x; cbn [loadM dumpM mview fst snd].
+  - apply load_dump_S.
+  - apply load_dump_A.
+  - apply load_dump_A.
+Qed.
+
+(** Running a block from a reloaded dump: same receipts, same lookups. *)
+
+Theorem engine_persist :
+  forall ts mf,
+    snd (engine_run (loadM (dumpM mf)) ts) = snd (engine_run mf ts)
+    /\ mAeq (fst (engine_run (loadM (dumpM mf)) ts))
+            (mview (fst (engine_run mf ts))).
+Proof.
+  intros ts mf.
+  pose proof (engine_run_sim ts (loadM (dumpM mf)) (mview mf)
+                (persistence_roundtrip mf)) as [H1 H2].
+  pose proof (engine_run_sim ts mf (mview mf) (mAeq_view mf)) as [H3 H4].
+  split.
+  - rewrite H2, H4. reflexivity.
+  - destruct H1 as (Ha & Hb & Hc). destruct H3 as (Hd & He & Hf).
+    refine (conj _ (conj _ _)); intro x;
+      cbn [mview fst snd].
+    + rewrite (Ha x). symmetry. apply Hd.
+    + rewrite (Hb x). symmetry. apply He.
+    + rewrite (Hc x). symmetry. apply Hf.
 Qed.
 
 (* __SENTINEL__ *)
