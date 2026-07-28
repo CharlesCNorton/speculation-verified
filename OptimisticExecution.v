@@ -7906,3 +7906,512 @@ Qed.
 (* __SENTINEL__ *)
 
 End Machine.
+
+(** * An instance
+
+    A concrete cost schedule, refund, coinbase, and base fee; a small
+    contract library written in the checkable language and compiled into
+    the executable one; and a block exercising admission, calls with and
+    without value, nested calls, reverts, out-of-gas, refunds, and
+    rejection.  Every number below is computed by the kernel. *)
+
+Definition C1 : costs := Costs 20 5 3 4 4 2 3 6 8 12 9 21.
+Definition R1 : nat := 15.
+Definition CB1 : addr := 90.
+Definition BF1 : nat := 7.
+
+Lemma unit_costs_C1 : unit_costs C1.
+Proof. unfold unit_costs, C1; cbn; repeat split; lia. Qed.
+
+Definition CODEX1 (c : addr) : ftx :=
+  match c with
+  | 1 => XRead 0 (XWrite 0 (FAdd (FVar 0) (FConst 1))
+                         (XRet (FAdd (FVar 0) (FConst 1))))
+  | 2 => XPay 91 (FConst 3) (XRet (FVar 0))
+  | 3 => XCall 1 (FVar 0) (FConst 0) (XRet (FVar 0))
+  | _ => XDone
+  end.
+
+Definition CODE1 (c : addr) (arg : val) : tx := fcompile [arg] (CODEX1 c).
+
+Lemma CODE1_compiled :
+  forall c arg, CODE1 c arg = fcompile [arg] (CODEX1 c).
+Proof. reflexivity. Qed.
+
+Definition st0 : storage :=
+  kupd (kupd (kupd (fun _ => 0) (1, 0) 5) (11, 5) 2) (12, 7) 1.
+
+Definition bk0 : bank :=
+  bupd (bupd (bupd (bupd (fun _ => 0) 10 3000) 11 3000) 12 3000) 2 500.
+
+Definition nm0 : nonces := fun _ => 0.
+
+Definition m0 : mach := (st0, bk0, nm0).
+
+(** Position 0 calls the counter; 1 overwrites a nonzero slot; 2 calls a
+    contract that calls the counter and emits its return; 3 carries a
+    stale nonce and is rejected; 4 reverts after a write; 5 loops until it
+    runs out of gas; 6 clears a nonzero slot and earns the refund. *)
+
+Definition blk1 : list fitem :=
+  [ (10, 0, XCall 1 (FConst 7) (FConst 0) XDone, 100, 2)
+  ; (11, 0, XWrite 5 (FConst 9) XDone, 80, 3)
+  ; (10, 1, XCall 3 (FConst 4) (FConst 0) (XEmit (FVar 0) XDone), 120, 1)
+  ; (12, 3, XWrite 1 (FConst 1) XDone, 80, 2)
+  ; (11, 1, XWrite 6 (FConst 1) XRevert, 80, 2)
+  ; (12, 0, XWhile 7 (XWrite 7 (FConst 1) XDone) XDone, 80, 1)
+  ; (11, 2, XWrite 5 (FConst 0) XDone, 80, 2)
+  ].
+
+Definition ts1 : list item := map citem blk1.
+
+Definition run1 := seq_execr C1 R1 CODE1 CB1 BF1 m0 ts1.
+Definition rs1 : list rcpt := snd run1.
+Definition mm1 : mach := fst run1.
+
+Definition rc_st (r : rcpt) : status := fst (fst (fst (fst r))).
+Definition rc_gas (r : rcpt) : nat := snd (fst (fst (fst r))).
+Definition rc_buf (r : rcpt) : buffer := snd (fst (fst r)).
+Definition rc_evs (r : rcpt) : list val := snd (fst r).
+Definition rc_tvs (r : rcpt) : list transfer := snd r.
+
+Definition AA : list addr := [90; 91; 2; 10; 11; 12].
+
+Example ex_status :
+  map rc_st rs1 = [SOk; SOk; SOk; SRejected; SRev; SRev; SOk].
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_consumed : map rc_gas rs1 = [58; 38; 78; 0; 53; 77; 23].
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_buffers :
+  map rc_buf rs1
+  = [[(1, 0, 6)]; [(11, 5, 9)]; [(1, 0, 7)]; []; []; []; [(11, 5, 0)]].
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_events : map rc_evs rs1 = [[]; []; [7]; []; []; []; []].
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_storage :
+  (fst (fst mm1) (1, 0), fst (fst mm1) (11, 5), fst (fst mm1) (12, 7))
+  = (7, 0, 1).
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_bank :
+  map (fun a => N.of_nat (snd (fst mm1) a)) AA
+  = [537; 0; 500; 1854; 1936; 2384]%N.
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_nonces : map (snd mm1) [10; 11; 12] = [2; 3; 1].
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_burn : burned BF1 rs1 = 2289.
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_admitted : nonrejected rs1 = 6.
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_supply :
+  N.of_nat (asum (snd (fst mm1)) AA + burned BF1 rs1)
+  = N.of_nat (asum bk0 AA).
+Proof. vm_compute. reflexivity. Qed.
+
+(** ** Merging speculations
+
+    Base-state speculation conflicts at the two positions whose reads the
+    prefix moved; junk speculation conflicts everywhere it is consulted;
+    prefix speculation never conflicts.  The receipts are the sequential
+    ones in every case. *)
+
+Definition junk1 : spec :=
+  (fun n k => n + fst k + snd k, fun n a => n + a, fun n a => n).
+Definition base_specs : list spec := map (fun _ => spec_of m0) ts1.
+Definition junk_specs : list spec := map (fun _ => junk1) ts1.
+Definition pre_specs : list spec := prefix_specs C1 R1 CODE1 CB1 BF1 m0 ts1.
+
+Example ex_conflicts_base :
+  snd (omerge C1 R1 CODE1 CB1 BF1 m0 ts1 base_specs) = 2.
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_conflicts_junk :
+  snd (omerge C1 R1 CODE1 CB1 BF1 m0 ts1 junk_specs) = 6.
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_conflicts_prefix :
+  snd (omerge C1 R1 CODE1 CB1 BF1 m0 ts1 pre_specs) = 0.
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_flags_base :
+  reexec_flags C1 R1 CODE1 CB1 BF1 m0 ts1 base_specs
+  = [false; false; true; false; false; false; true].
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_executions :
+  (executions C1 R1 CODE1 CB1 BF1 m0 ts1 base_specs,
+   executions C1 R1 CODE1 CB1 BF1 m0 ts1 junk_specs) = (8, 12).
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_merge_receipts :
+  snd (fst (omerge C1 R1 CODE1 CB1 BF1 m0 ts1 junk_specs)) = rs1.
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_retry_work : retry_execs C1 R1 CODE1 CB1 BF1 m0 ts1 = 49.
+Proof. vm_compute. reflexivity. Qed.
+
+(** ** The engine
+
+    The same block on AVL maps.  The cleared slot is absent from the dump
+    rather than bound to zero, and dumping a reloaded dump is the identity
+    on the association lists. *)
+
+Definition mf0 : machA :=
+  loadM ([((1, 0), 5); ((11, 5), 2); ((12, 7), 1)],
+         [(10, 3000); (11, 3000); (12, 3000); (2, 500)],
+         []).
+
+Definition erun1 := engine_run C1 R1 CODE1 CB1 BF1 mf0 ts1.
+
+Example ex_engine_receipts : snd erun1 = rs1.
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_engine_storage :
+  fst (fst (dumpM (fst erun1))) = [(1, 0, 7); (12, 7, 1)].
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_engine_bank :
+  map (fun p => (fst p, N.of_nat (snd p))) (snd (fst (dumpM (fst erun1))))
+  = [(2, 500%N); (10, 1854%N); (11, 1936%N); (12, 2384%N); (90, 537%N)].
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_engine_nonces :
+  snd (dumpM (fst erun1)) = [(10, 2); (11, 3); (12, 1)].
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_engine_roundtrip :
+  dumpM (loadM (dumpM (fst erun1))) = dumpM (fst erun1).
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_engine_merge :
+  snd (fst (engine_merge C1 R1 CODE1 CB1 BF1 mf0 ts1 junk_specs)) = rs1
+  /\ snd (engine_merge C1 R1 CODE1 CB1 BF1 mf0 ts1 junk_specs) = 6.
+Proof. split; vm_compute; reflexivity. Qed.
+
+(** ** The scheduler
+
+    Executing in order and committing costs no re-execution.  A shuffle
+    that still runs every writer before its reader costs none either.  The
+    order that runs two readers first pays exactly two re-executions.  The
+    receipts are the sequential ones in all three. *)
+
+Definition acts1 : list oact :=
+  map AExec (seq 0 (length ts1)) ++ repeat ACommit (length ts1).
+Definition acts2 : list oact :=
+  [AExec 3; AExec 1; AExec 5; AExec 0; AExec 2; AExec 4; AExec 6]
+  ++ repeat ACommit (length ts1).
+Definition acts3 : list oact :=
+  [AExec 2; AExec 6; AExec 0; AExec 1; AExec 3; AExec 4; AExec 5]
+  ++ repeat ACommit (length ts1).
+
+Definition os1 := reach C1 R1 CODE1 CB1 BF1 ts1 (oinit m0) acts1.
+Definition os2 := reach C1 R1 CODE1 CB1 BF1 ts1 (oinit m0) acts2.
+Definition os3 := reach C1 R1 CODE1 CB1 BF1 ts1 (oinit m0) acts3.
+
+Example ex_op_inorder : (os_c os1, os_rx os1) = (7, 0).
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_op_shuffle : (os_c os2, os_rx os2) = (7, 0).
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_op_stale : (os_c os3, os_rx os3) = (7, 2).
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_op_receipts :
+  os_rs os1 = rs1 /\ os_rs os2 = rs1 /\ os_rs os3 = rs1.
+Proof. refine (conj _ (conj _ _)); vm_compute; reflexivity. Qed.
+
+(** ** The static checker
+
+    A block whose footprints are pairwise disjoint passes and merges from
+    base-state speculation without a conflict; the block above does not
+    pass, and indeed conflicts. *)
+
+Definition dblk : list fitem :=
+  [ (10, 0, XWrite 1 (FConst 3) XDone, 80, 1)
+  ; (11, 0, XWrite 2 (FConst 4) XDone, 80, 1)
+  ; (12, 0, XWrite 3 (FConst 5) XDone, 80, 1) ].
+
+Definition dts : list item := map citem dblk.
+
+Example ex_check_pass : static_check CB1 CODEX1 [] dblk = true.
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_check_no_conflict :
+  snd (omerge C1 R1 CODE1 CB1 BF1 m0 dts (map (fun _ => spec_of m0) dts)) = 0.
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_check_reject : static_check CB1 CODEX1 [1; 2; 3] blk1 = false.
+Proof. vm_compute. reflexivity. Qed.
+
+(** ** The critical path
+
+    A chain in which each position reads what the previous one wrote has
+    canonical levels 0, 1, 2, 3: no schedule of validated speculations
+    finishes it in fewer rounds. *)
+
+Definition FRs1 : list (list key) := [[(1,0)]; [(1,0)]; [(2,0)]; [(3,0)]].
+Definition FWs1 : list (list key) := [[(1,0)]; [(2,0)]; [(3,0)]; [(4,0)]].
+
+Example ex_levels : levels FRs1 FWs1 = [0; 1; 2; 3].
+Proof. vm_compute. reflexivity. Qed.
+
+Example ex_lcan :
+  (Lcan FRs1 FWs1 0, Lcan FRs1 FWs1 1, Lcan FRs1 FWs1 2, Lcan FRs1 FWs1 3)
+  = (0, 1, 2, 3).
+Proof. vm_compute. reflexivity. Qed.
+
+(** * Randomized harness
+
+    Three hundred pseudorandom blocks, each of five transactions over
+    three accounts and a three-contract library, with per-account nonces
+    that are sometimes deliberately stale, gas limits that sometimes bind,
+    and speculations drawn from true prefix states, the base state, junk,
+    and half-position states, with the speculation list sometimes short.
+
+    Each block is checked at every layer: merge receipts against
+    sequential receipts, merged state against sequential state on the keys
+    and accounts the receipts name, the engine's receipts and lookups, the
+    engine merge's receipts and conflict count, the dump round-trip, the
+    absence of zero bindings, the scheduler's receipts under in-order and
+    reversed execution with no re-execution when every transaction is
+    admitted, and supply conservation over the block's parties. *)
+
+Definition status_eqb (a b : status) : bool :=
+  match a, b with
+  | SOk, SOk => true | SRev, SRev => true | SRejected, SRejected => true
+  | _, _ => false
+  end.
+
+Definition kv_eqb (p q : key * val) : bool :=
+  keqb (fst p) (fst q) && (snd p =? snd q).
+
+Definition tv_eqb (p q : transfer) : bool :=
+  let '(s1, d1, a1) := p in let '(s2, d2, a2) := q in
+  (s1 =? s2) && (d1 =? d2) && (a1 =? a2).
+
+Definition leqb {A : Type} (f : A -> A -> bool) (l1 l2 : list A) : bool :=
+  (length l1 =? length l2)
+  && forallb (fun p => f (fst p) (snd p)) (combine l1 l2).
+
+Definition rcpt_eqb (r1 r2 : rcpt) : bool :=
+  let '(s1, u1, w1, e1, v1) := r1 in
+  let '(s2, u2, w2, e2, v2) := r2 in
+  status_eqb s1 s2 && (u1 =? u2) && leqb kv_eqb w1 w2
+  && leqb Nat.eqb e1 e2 && leqb tv_eqb v1 v2.
+
+Definition rcpts_eqb : list rcpt -> list rcpt -> bool := leqb rcpt_eqb.
+
+Definition kvl_eqb : list (key * nat) -> list (key * nat) -> bool :=
+  leqb kv_eqb.
+
+Definition avl_eqb : list (addr * nat) -> list (addr * nat) -> bool :=
+  leqb (fun p q => (fst p =? fst q) && (snd p =? snd q)).
+
+Definition dump_eqb
+  (d1 d2 : list (key * nat) * list (addr * nat) * list (addr * nat)) : bool :=
+  kvl_eqb (fst (fst d1)) (fst (fst d2))
+  && avl_eqb (snd (fst d1)) (snd (fst d2))
+  && avl_eqb (snd d1) (snd d2).
+
+Definition nstep (s : N) : N := N.modulo (1103515245 * s + 12345) 2147483648.
+
+Definition nsmall (s : N) (m : nat) : nat :=
+  N.to_nat (N.modulo (N.div s 1024) (N.of_nat m)).
+
+Fixpoint gftx (d : nat) (s : N) : ftx * N :=
+  match d with
+  | 0 => (XDone, nstep s)
+  | S d' =>
+      let r := nsmall s 10 in
+      let s1 := nstep s in
+      let a := nsmall s1 4 in
+      let s2 := nstep s1 in
+      let v := nsmall s2 3 in
+      let s3 := nstep s2 in
+      let c := 1 + nsmall s3 3 in
+      let s4 := nstep s3 in
+      let '(k, s5) := gftx d' s4 in
+      match r with
+      | 0 => (XDone, s5)
+      | 1 => (XWrite a (FConst v) k, s5)
+      | 2 => (XRead a k, s5)
+      | 3 => (XBal (10 + a) k, s5)
+      | 4 => (XNonce (10 + a) k, s5)
+      | 5 => (XEmit (FConst v) k, s5)
+      | 6 => (XPay (10 + a) (FConst v) k, s5)
+      | 7 => (XCall c (FConst v) (FConst 0) k, s5)
+      | 8 => (XCall c (FConst v) (FConst v) k, s5)
+      | _ => (XWhile a XDone k, s5)
+      end
+  end.
+
+Fixpoint gitems (n : nat) (s : N) (c0 c1 c2 : nat) : list fitem * N :=
+  match n with
+  | 0 => ([], s)
+  | S n' =>
+      let acc := nsmall s 3 in
+      let s1 := nstep s in
+      let bad := nsmall s1 7 in
+      let s2 := nstep s1 in
+      let g := 80 + nsmall s2 150 in
+      let s3 := nstep s2 in
+      let p := nsmall s3 4 in
+      let s4 := nstep s3 in
+      let '(x, s5) := gftx 4 s4 in
+      let cur := match acc with 0 => c0 | 1 => c1 | _ => c2 end in
+      let non := if bad =? 0 then S cur else cur in
+      let '(rest, s6) :=
+        gitems n' s5 (if (acc =? 0) && negb (bad =? 0) then S c0 else c0)
+                     (if (acc =? 1) && negb (bad =? 0) then S c1 else c1)
+                     (if (acc =? 2) && negb (bad =? 0) then S c2 else c2) in
+      ((10 + acc, non, x, g, p) :: rest, s6)
+  end.
+
+Fixpoint gspecs (n : nat) (s : N) (m : mach) (ts : list item) (j : nat)
+  : list spec :=
+  match n with
+  | 0 => []
+  | S n' =>
+      let t := nsmall s 4 in
+      let s1 := nstep s in
+      let sp :=
+        match t with
+        | 0 => spec_of (mach_at C1 R1 CODE1 CB1 BF1 m ts j)
+        | 1 => spec_of m
+        | 2 => (fun i k => i + fst k + snd k, fun i a => i + a, fun i a => i)
+        | _ => spec_of (mach_at C1 R1 CODE1 CB1 BF1 m ts (Nat.div j 2))
+        end in
+      sp :: gspecs n' s1 m ts (S j)
+  end.
+
+Definition hbk0 : bank :=
+  bupd (bupd (bupd (bupd (fun _ => 0) 10 6000) 11 6000) 12 6000) 2 500.
+
+Definition hm0 : mach := (st0, hbk0, nm0).
+
+Definition hmf0 : machA :=
+  loadM ([((1, 0), 5); ((11, 5), 2); ((12, 7), 1)],
+         [(10, 6000); (11, 6000); (12, 6000); (2, 500)],
+         []).
+
+Definition check (seed : nat) : bool :=
+  let s := N.of_nat (1 + seed) in
+  let '(fis, s1) := gitems 5 s 0 0 0 in
+  let ts := map citem fis in
+  let n := length ts in
+  let specs := firstn (n - nsmall s1 3) (gspecs n s1 hm0 ts 0) in
+  let '(mm, rs, cnt) := omerge C1 R1 CODE1 CB1 BF1 hm0 ts specs in
+  let '(m2, rs2) := seq_execr C1 R1 CODE1 CB1 BF1 hm0 ts in
+  let ks := map fst (concat (map rc_buf rs2)) in
+  let ads := CB1 :: tx_parties ts rs2 in
+  let adn := nodup Nat.eq_dec ads in
+  let allok := forallb (fun r => negb (status_eqb (rc_st r) SRejected)) rs2 in
+  let '(mfN, rsE) := engine_run C1 R1 CODE1 CB1 BF1 hmf0 ts in
+  let '(mfM, rsM, cntM) := engine_merge C1 R1 CODE1 CB1 BF1 hmf0 ts specs in
+  let osA := reach C1 R1 CODE1 CB1 BF1 ts (oinit hm0)
+               (map AExec (seq 0 n) ++ repeat ACommit n) in
+  let osB := reach C1 R1 CODE1 CB1 BF1 ts (oinit hm0)
+               (map AExec (rev (seq 0 n)) ++ repeat ACommit n) in
+  rcpts_eqb rs rs2
+  && forallb (fun k => fst (fst mm) k =? fst (fst m2) k) ks
+  && forallb (fun a => snd (fst mm) a =? snd (fst m2) a) ads
+  && forallb (fun a => snd mm a =? snd m2 a) ads
+  && rcpts_eqb rsE rs2
+  && rcpts_eqb rsM rs2
+  && (cnt =? cntM)
+  && forallb (fun k => slookA (fst (fst mfN)) k =? fst (fst m2) k) ks
+  && forallb (fun a => alookA (snd (fst mfN)) a =? snd (fst m2) a) ads
+  && forallb (fun a => alookA (snd mfN) a =? snd m2 a) ads
+  && dump_eqb (dumpM (loadM (dumpM mfN))) (dumpM mfN)
+  && forallb (fun p => negb (snd p =? 0)) (fst (fst (dumpM mfN)))
+  && forallb (fun p => negb (snd p =? 0)) (snd (fst (dumpM mfN)))
+  && rcpts_eqb (os_rs osA) rs2 && (os_c osA =? n)
+  && implb allok (os_rx osA =? 0)
+  && rcpts_eqb (os_rs osB) rs2 && (os_c osB =? n)
+  && (asum (snd (fst m2)) adn + burned BF1 rs2 =? asum hbk0 adn).
+
+Definition harness (n : nat) : bool := forallb check (seq 0 n).
+
+Example harness_300 : harness 300 = true.
+Proof. vm_compute. reflexivity. Qed.
+
+(** * Assumptions
+
+    Every principal result is closed under the global context. *)
+
+Print Assumptions optimistic_correct.
+Print Assumptions speculation_irrelevant.
+Print Assumptions fast_path.
+Print Assumptions reexec_bound.
+Print Assumptions reexec_per_tx.
+Print Assumptions executions_law.
+Print Assumptions work_upper.
+Print Assumptions work_lower.
+Print Assumptions runp_fuel_ext.
+Print Assumptions fuel_not_binding.
+Print Assumptions interleaving_safe.
+Print Assumptions scheduler_correct.
+Print Assumptions dispatch_in_order.
+Print Assumptions scheduler_in_order_optimal.
+Print Assumptions work_inorder.
+Print Assumptions dispatch_complete.
+Print Assumptions retry_progress.
+Print Assumptions retry_converges.
+Print Assumptions retry_round_progress.
+Print Assumptions retry_loop_converges.
+Print Assumptions retry_work_bound.
+Print Assumptions retry_flags.
+Print Assumptions selective_retry_bound.
+Print Assumptions money_conservation.
+Print Assumptions omerge_money_conservation.
+Print Assumptions nonce_law.
+Print Assumptions supply_conservation_abstract.
+Print Assumptions static_disjoint_free.
+Print Assumptions work_disjoint.
+Print Assumptions checked_disjoint_free.
+Print Assumptions estimated_order_free.
+Print Assumptions level_rounds_bound.
+Print Assumptions level_rounds_converge.
+Print Assumptions canonical_level_increases.
+Print Assumptions canonical_rounds_converge.
+Print Assumptions op_safety.
+Print Assumptions op_liveness.
+Print Assumptions op_reexec_bound.
+Print Assumptions op_fair_completion.
+Print Assumptions op_overlay_true.
+Print Assumptions op_fast_path.
+Print Assumptions engine_correct.
+Print Assumptions engine_supply.
+Print Assumptions persistence_roundtrip.
+Print Assumptions engine_persist.
+Print Assumptions engine_dump_nonzero.
+Print Assumptions harness_300.
+
+(** * Extraction
+
+    The engine, the merge, the sequential reference, persistence, the
+    generators, and the harness extract to OCaml.  Numbers extract as
+    unary naturals, so the driver converts at the boundary rather than
+    trusting an unverified numeric representation. *)
+
+From Stdlib Require Import Extraction.
+Extraction Language OCaml.
+Set Extraction Optimize.
+
+Definition occ_run := engine_run C1 R1 CODE1 CB1 BF1.
+Definition occ_merge := engine_merge C1 R1 CODE1 CB1 BF1.
+Definition occ_seq := seq_execr C1 R1 CODE1 CB1 BF1.
+Definition occ_specs := prefix_specs C1 R1 CODE1 CB1 BF1.
+
+Extraction "occ_engine.ml"
+  occ_run occ_merge occ_seq occ_specs
+  dumpM loadM citem spec_of mf0 hmf0 ts1 check harness.
