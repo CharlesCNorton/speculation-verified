@@ -7341,6 +7341,248 @@ Proof.
     exact (conj (conj Hst (conj Hb2 Hn')) eq_refl).
 Qed.
 
+(** One-step simulation: the engine step and the shared step at any
+    pointwise-agreeing functional state produce equal receipts, equal
+    conflict flags, and pointwise-agreeing states. *)
+
+Lemma stepA_sim :
+  forall mf m i,
+    mAeq mf m ->
+    mAeq (fst (stepA mf i)) (fst (step m i))
+    /\ snd (stepA mf i) = snd (step m i).
+Proof.
+  intros [[stf bkf] nmf] [[st bk] nm] i (Hst & Hbk & Hnm).
+  cbn [fst snd] in Hst, Hbk, Hnm.
+  destruct i as [[[[fee non] t] g] p].
+  assert (Hg : gateb (alookA bkf) (alookA nmf) (fee, non, t, g, p)
+               = gateb bk nm (fee, non, t, g, p)).
+  { cbn [gateb]. rewrite Hbk, Hnm. reflexivity. }
+  unfold stepA, step. cbn beta iota zeta. rewrite Hg.
+  destruct (gateb bk nm (fee, non, t, g, p)) eqn:Hgate.
+  - assert (Ho : runt (fee, non, t, g, p)
+                   (of_state (slookA stf)) (of_bank (alookA bkf))
+                   (of_nonces (alookA nmf))
+                 = runt (fee, non, t, g, p)
+                     (of_state st) (of_bank bk) (of_nonces nm)).
+    { apply runt_rd_ext; intros; cbn [of_state of_bank of_nonces];
+        [apply Hst | apply Hbk | apply Hnm]. }
+    rewrite Ho.
+    exact (finishA_sim stf bkf nmf st bk nm fee g p _ Hst Hbk Hnm).
+  - cbn [fst snd].
+    exact (conj (conj Hst (conj Hbk Hnm)) eq_refl).
+Qed.
+
+Lemma cstepA_sim :
+  forall mf m i oo,
+    mAeq mf m ->
+    mAeq (fst (fst (cstepA mf i oo))) (fst (fst (cstep m i oo)))
+    /\ snd (fst (cstepA mf i oo)) = snd (fst (cstep m i oo))
+    /\ snd (cstepA mf i oo) = snd (cstep m i oo).
+Proof.
+  intros [[stf bkf] nmf] [[st bk] nm] i oo Hm.
+  pose proof Hm as (Hst & Hbk & Hnm).
+  cbn [fst snd] in Hst, Hbk, Hnm.
+  destruct i as [[[[fee non] t] g] p].
+  assert (Hg : gateb (alookA bkf) (alookA nmf) (fee, non, t, g, p)
+               = gateb bk nm (fee, non, t, g, p)).
+  { cbn [gateb]. rewrite Hbk, Hnm. reflexivity. }
+  unfold cstepA, cstep. cbn beta iota zeta. rewrite Hg.
+  destruct (gateb bk nm (fee, non, t, g, p)) eqn:Hgate.
+  - destruct oo as [o |].
+    + assert (Hv : vcheck (slookA stf) (alookA bkf) (alookA nmf) o
+                   = vcheck st bk nm o).
+      { unfold vcheck, nvalid.
+        rewrite (valid_ext _ _ _ Hst), (bvalid_ext _ _ _ Hbk),
+          (bvalid_ext _ _ _ Hnm).
+        reflexivity. }
+      cbn [option_map]. rewrite Hv. destruct (vcheck st bk nm o).
+      * cbn [fst snd].
+        destruct (finishA_sim stf bkf nmf st bk nm fee g p o Hst Hbk Hnm)
+          as [H1 H2].
+        exact (conj H1 (conj H2 eq_refl)).
+      * destruct (stepA_sim _ _ (fee, non, t, g, p) Hm) as [H1 H2].
+        cbn [fst snd].
+        exact (conj H1 (conj H2 eq_refl)).
+    + destruct (stepA_sim _ _ (fee, non, t, g, p) Hm) as [H1 H2].
+      cbn [fst snd].
+      exact (conj H1 (conj H2 eq_refl)).
+  - cbn [fst snd].
+    exact (conj (conj Hst (conj Hbk Hnm)) (conj eq_refl eq_refl)).
+Qed.
+
+(** The engine merge: the instrumented fold of the engine step over a
+    block and its speculations, mirroring [omergeX] with the same
+    execution counting, and its erasure. *)
+
+Definition mstepA (mf : machA) (i : item) (os : option spec)
+  : (machA * rcpt) * bool * nat :=
+  let '(mr, fl) := cstepA mf i (option_map (spec_out i) os) in
+  let '(stf, bkf, nmf) := mf in
+  (mr, fl,
+   if gateb (alookA bkf) (alookA nmf) i
+   then match os with Some _ => if fl then 2 else 1 | None => 1 end
+   else 0).
+
+Fixpoint engine_mergeX (mf : machA) (ts : list item) (specs : list spec)
+  : machA * list rcpt * list bool * nat :=
+  match ts with
+  | [] => (mf, [], [], 0)
+  | i :: rest =>
+      let '(mr, fl, x) := mstepA mf i (hd_error specs) in
+      let '(mf1, r) := mr in
+      let '(mf2, rs, fls, xs) := engine_mergeX mf1 rest (tl specs) in
+      (mf2, r :: rs, fl :: fls, x + xs)
+  end.
+
+Definition engine_merge (mf : machA) (ts : list item) (specs : list spec)
+  : machA * list rcpt * nat :=
+  let '(mf2, rs, fls, _) := engine_mergeX mf ts specs in
+  (mf2, rs, count_true fls).
+
+Fixpoint engine_run (mf : machA) (ts : list item) : machA * list rcpt :=
+  match ts with
+  | [] => (mf, [])
+  | i :: rest =>
+      let '(mf1, r) := stepA mf i in
+      let '(mf2, rs) := engine_run mf1 rest in
+      (mf2, r :: rs)
+  end.
+
+Lemma mstepA_sim :
+  forall mf m i os,
+    mAeq mf m ->
+    mAeq (fst (fst (fst (mstepA mf i os)))) (fst (fst (fst (mstep m i os))))
+    /\ snd (fst (fst (mstepA mf i os))) = snd (fst (fst (mstep m i os)))
+    /\ snd (fst (mstepA mf i os)) = snd (fst (mstep m i os))
+    /\ snd (mstepA mf i os) = snd (mstep m i os).
+Proof.
+  intros [[stf bkf] nmf] [[st bk] nm] i os Hm.
+  pose proof Hm as (Hst & Hbk & Hnm).
+  cbn [fst snd] in Hst, Hbk, Hnm.
+  destruct i as [[[[fee non] t] g] p].
+  assert (Hg : gateb (alookA bkf) (alookA nmf) (fee, non, t, g, p)
+               = gateb bk nm (fee, non, t, g, p)).
+  { cbn [gateb]. rewrite Hbk, Hnm. reflexivity. }
+  destruct (cstepA_sim _ _ (fee, non, t, g, p)
+              (option_map (spec_out (fee, non, t, g, p)) os) Hm)
+    as (H1 & H2 & H3).
+  unfold mstepA, mstep. cbn beta iota zeta. rewrite Hg.
+  destruct (cstepA (stf, bkf, nmf) (fee, non, t, g, p)
+              (option_map (spec_out (fee, non, t, g, p)) os))
+    as [[mf1 r'] fl'] eqn:EA.
+  destruct (cstep (st, bk, nm) (fee, non, t, g, p)
+              (option_map (spec_out (fee, non, t, g, p)) os))
+    as [[m1 r] fl] eqn:EB.
+  cbn [fst snd] in H1, H2, H3. subst r' fl'.
+  cbn [fst snd].
+  exact (conj H1 (conj eq_refl (conj eq_refl eq_refl))).
+Qed.
+
+Lemma engine_run_sim :
+  forall ts mf m,
+    mAeq mf m ->
+    mAeq (fst (engine_run mf ts)) (fst (seq_execr m ts))
+    /\ snd (engine_run mf ts) = snd (seq_execr m ts).
+Proof.
+  induction ts as [| i rest IH]; intros mf m Hm.
+  - cbn. exact (conj Hm eq_refl).
+  - cbn [engine_run seq_execr].
+    destruct (stepA_sim mf m i Hm) as [H1 H2].
+    destruct (stepA mf i) as [mf1 r'] eqn:EA.
+    destruct (step m i) as [m1 r] eqn:EB.
+    cbn [fst snd] in H1, H2. subst r'.
+    destruct (IH mf1 m1 H1) as [H3 H4].
+    destruct (engine_run mf1 rest) as [mf2 rs'] eqn:EC.
+    destruct (seq_execr m1 rest) as [m2 rs] eqn:ED.
+    cbn [fst snd] in H3, H4. subst rs'.
+    cbn [fst snd]. exact (conj H3 eq_refl).
+Qed.
+
+Lemma engine_mergeX_sim :
+  forall ts specs mf m,
+    mAeq mf m ->
+    mAeq (fst (fst (fst (engine_mergeX mf ts specs))))
+         (fst (fst (fst (omergeX m ts specs))))
+    /\ snd (fst (fst (engine_mergeX mf ts specs)))
+       = snd (fst (fst (omergeX m ts specs)))
+    /\ snd (fst (engine_mergeX mf ts specs))
+       = snd (fst (omergeX m ts specs))
+    /\ snd (engine_mergeX mf ts specs) = snd (omergeX m ts specs).
+Proof.
+  induction ts as [| i rest IH]; intros specs mf m Hm.
+  - cbn. exact (conj Hm (conj eq_refl (conj eq_refl eq_refl))).
+  - cbn [engine_mergeX omergeX].
+    destruct (mstepA_sim mf m i (hd_error specs) Hm)
+      as (H1 & H2 & H3 & H4).
+    destruct (mstepA mf i (hd_error specs)) as [[[mf1 r'] fl'] x'] eqn:EA.
+    destruct (mstep m i (hd_error specs)) as [[[m1 r] fl] x] eqn:EB.
+    cbn [fst snd] in H1, H2, H3, H4. subst r' fl' x'.
+    destruct (IH (tl specs) mf1 m1 H1) as (H5 & H6 & H7 & H8).
+    destruct (engine_mergeX mf1 rest (tl specs))
+      as [[[mf2 rs'] fls'] xs'] eqn:EC.
+    destruct (omergeX m1 rest (tl specs)) as [[[m2 rs] fls] xs] eqn:ED.
+    cbn [fst snd] in H5, H6, H7, H8. subst rs' fls' xs'.
+    cbn [fst snd].
+    exact (conj H5 (conj eq_refl (conj eq_refl eq_refl))).
+Qed.
+
+(** Engine correctness: the merge over any speculations reproduces the
+    engine's own sequential receipts and final state.  Both transport to
+    the functional machine at the viewed state, where the merge equals
+    sequential execution outright. *)
+
+Theorem engine_correct :
+  forall ts specs mf,
+    snd (fst (engine_merge mf ts specs)) = snd (engine_run mf ts)
+    /\ mAeq (fst (fst (engine_merge mf ts specs)))
+            (mview (fst (engine_run mf ts))).
+Proof.
+  intros ts specs mf.
+  pose proof (engine_mergeX_sim ts specs mf (mview mf) (mAeq_view mf))
+    as (H1 & H2 & H3 & H4).
+  pose proof (engine_run_sim ts mf (mview mf) (mAeq_view mf)) as [H5 H6].
+  pose proof (optimistic_correct ts specs (mview mf)) as Hoc.
+  unfold omerge in Hoc.
+  unfold engine_merge.
+  destruct (engine_mergeX mf ts specs) as [[[mf2 rs'] fls'] xs'] eqn:EA.
+  destruct (omergeX (mview mf) ts specs) as [[[m2 rs] fls] xs] eqn:EB.
+  cbn [fst snd] in H1, H2, H3, H4. cbn in Hoc.
+  destruct (engine_run mf ts) as [mfr rsr] eqn:EC.
+  destruct (seq_execr (mview mf) ts) as [mr rss] eqn:ED.
+  cbn [fst snd] in H5, H6.
+  injection Hoc as Hm Hr.
+  cbn [fst snd]. subst.
+  split.
+  - reflexivity.
+  - destruct H1 as (Ha & Hb & Hc).
+    destruct H5 as (Hd & He & Hf).
+    refine (conj _ (conj _ _)); intro x.
+    + rewrite (Ha x). symmetry. apply Hd.
+    + rewrite (Hb x). symmetry. apply He.
+    + rewrite (Hc x). symmetry. apply Hf.
+Qed.
+
+(** Engine supply conservation: over any duplicate-free address cover of
+    the block's transacting parties and the coinbase, the engine's final
+    balances plus the burn equal the initial balances. *)
+
+Theorem engine_supply :
+  forall ts mf A,
+    NoDup A -> In CB A ->
+    incl (tx_parties ts (snd (engine_run mf ts))) A ->
+    asum (alookA (snd (fst (fst (engine_run mf ts))))) A
+      + burned (snd (engine_run mf ts))
+    = asum (alookA (snd (fst mf))) A.
+Proof.
+  intros ts mf A Hnd Hcb Hincl.
+  pose proof (engine_run_sim ts mf (mview mf) (mAeq_view mf)) as [Hm Hr].
+  pose proof (supply_conservation_abstract ts (mview mf) A Hnd Hcb) as Hs.
+  rewrite <- Hr in Hs. specialize (Hs Hincl).
+  destruct Hm as (Ha & Hb & Hc).
+  rewrite (asum_ext A _ _ Hb).
+  exact Hs.
+Qed.
+
 (* __SENTINEL__ *)
 
 End Machine.
