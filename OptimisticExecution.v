@@ -7716,6 +7716,193 @@ Proof.
     + rewrite (Hc x). symmetry. apply Hf.
 Qed.
 
+(** ** No dead bindings
+
+    Writing zero deletes, so no engine state ever binds zero: the empty
+    state has no bindings, and every execution, validation, and settlement
+    step preserves the property.  A dumped state therefore lists exactly
+    the nonzero entries, and its size is the count of live slots and
+    funded accounts rather than of every slot ever touched. *)
+
+Definition smnz (m : smap) : Prop :=
+  forall k v, SM.MapsTo k v m -> v <> 0.
+
+Definition amnz (m : amap) : Prop :=
+  forall a v, AM.MapsTo a v m -> v <> 0.
+
+Definition machnz (mf : machA) : Prop :=
+  smnz (fst (fst mf)) /\ amnz (snd (fst mf)) /\ amnz (snd mf).
+
+Lemma commitA_cons :
+  forall p w m,
+    commitA m (p :: w) = supdA (commitA m w) (fst p) (snd p).
+Proof. reflexivity. Qed.
+
+Lemma empty_machnz :
+  machnz (SM.empty nat, AM.empty nat, AM.empty nat).
+Proof.
+  refine (conj _ (conj _ _)); cbn [fst snd]; intros x v HM.
+  - apply SF.empty_mapsto_iff in HM. contradiction.
+  - apply AF.empty_mapsto_iff in HM. contradiction.
+  - apply AF.empty_mapsto_iff in HM. contradiction.
+Qed.
+
+Lemma supdA_nz : forall m k v, smnz m -> smnz (supdA m k v).
+Proof.
+  intros m k v H k' v' HM. unfold supdA in HM.
+  destruct (v =? 0) eqn:Hz.
+  - apply SF.remove_mapsto_iff in HM. destruct HM as [_ HM].
+    exact (H _ _ HM).
+  - apply SF.add_mapsto_iff in HM. destruct HM as [[_ Hv] | [_ HM]].
+    + subst v'. apply Nat.eqb_neq. exact Hz.
+    + exact (H _ _ HM).
+Qed.
+
+Lemma aupdA_nz : forall m a v, amnz m -> amnz (aupdA m a v).
+Proof.
+  intros m a v H a' v' HM. unfold aupdA in HM.
+  destruct (v =? 0) eqn:Hz.
+  - apply AF.remove_mapsto_iff in HM. destruct HM as [_ HM].
+    exact (H _ _ HM).
+  - apply AF.add_mapsto_iff in HM. destruct HM as [[_ Hv] | [_ HM]].
+    + subst v'. apply Nat.eqb_neq. exact Hz.
+    + exact (H _ _ HM).
+Qed.
+
+Lemma commitA_nz : forall w m, smnz m -> smnz (commitA m w).
+Proof.
+  induction w as [| [k0 v0] r IH]; intros m H.
+  - exact H.
+  - rewrite commitA_cons. apply supdA_nz. apply IH. exact H.
+Qed.
+
+Lemma apply_tvsA_nz : forall l m, amnz m -> amnz (apply_tvsA m l).
+Proof.
+  induction l as [| [[s d] amt] r IH]; intros m H.
+  - exact H.
+  - cbn [apply_tvsA]. apply IH. apply aupdA_nz. apply aupdA_nz. exact H.
+Qed.
+
+Lemma finishA_nz :
+  forall stf bkf nmf fee g p o,
+    smnz stf -> amnz bkf -> amnz nmf ->
+    machnz (fst (finishA stf bkf nmf fee g p o)).
+Proof.
+  intros stf bkf nmf fee g p o H1 H2 H3.
+  unfold finishA. destruct (o_ok o).
+  - refine (conj _ (conj _ _)); cbn [fst snd].
+    + apply commitA_nz. exact H1.
+    + apply aupdA_nz. apply aupdA_nz. apply apply_tvsA_nz.
+      apply aupdA_nz. exact H2.
+    + apply aupdA_nz. exact H3.
+  - refine (conj _ (conj _ _)); cbn [fst snd].
+    + exact H1.
+    + apply aupdA_nz. apply aupdA_nz. exact H2.
+    + apply aupdA_nz. exact H3.
+Qed.
+
+Lemma stepA_nz : forall mf i, machnz mf -> machnz (fst (stepA mf i)).
+Proof.
+  intros [[stf bkf] nmf] i Hm. pose proof Hm as (H1 & H2 & H3).
+  cbn [fst snd] in H1, H2, H3.
+  destruct i as [[[[fee non] t] g] p].
+  unfold stepA. cbn beta iota zeta.
+  destruct (gateb (alookA bkf) (alookA nmf) (fee, non, t, g, p)).
+  - apply finishA_nz; assumption.
+  - exact Hm.
+Qed.
+
+Lemma cstepA_nz :
+  forall mf i oo, machnz mf -> machnz (fst (fst (cstepA mf i oo))).
+Proof.
+  intros [[stf bkf] nmf] i oo Hm. pose proof Hm as (H1 & H2 & H3).
+  cbn [fst snd] in H1, H2, H3.
+  destruct i as [[[[fee non] t] g] p].
+  unfold cstepA. cbn beta iota zeta.
+  destruct (gateb (alookA bkf) (alookA nmf) (fee, non, t, g, p)).
+  - destruct oo as [o |].
+    + destruct (vcheck (slookA stf) (alookA bkf) (alookA nmf) o).
+      * cbn [fst]. apply finishA_nz; assumption.
+      * cbn [fst]. apply stepA_nz. exact Hm.
+    + cbn [fst]. apply stepA_nz. exact Hm.
+  - cbn [fst]. exact Hm.
+Qed.
+
+Lemma mstepA_nz :
+  forall mf i os, machnz mf -> machnz (fst (fst (fst (mstepA mf i os)))).
+Proof.
+  intros [[stf bkf] nmf] i os Hm.
+  pose proof (cstepA_nz (stf, bkf, nmf) i
+                (option_map (spec_out i) os) Hm) as Hc.
+  unfold mstepA. cbn beta iota zeta.
+  destruct (cstepA (stf, bkf, nmf) i (option_map (spec_out i) os))
+    as [[mf1 r] fl] eqn:EA.
+  cbn [fst] in Hc. cbn [fst]. exact Hc.
+Qed.
+
+Lemma engine_run_nz :
+  forall ts mf, machnz mf -> machnz (fst (engine_run mf ts)).
+Proof.
+  induction ts as [| i rest IH]; intros mf H.
+  - exact H.
+  - cbn [engine_run].
+    pose proof (stepA_nz mf i H) as H1.
+    destruct (stepA mf i) as [mf1 r] eqn:EA. cbn [fst] in H1.
+    specialize (IH mf1 H1).
+    destruct (engine_run mf1 rest) as [mf2 rs] eqn:EB. cbn [fst] in IH.
+    cbn [fst]. exact IH.
+Qed.
+
+Lemma engine_mergeX_nz :
+  forall ts specs mf,
+    machnz mf -> machnz (fst (fst (fst (engine_mergeX mf ts specs)))).
+Proof.
+  induction ts as [| i rest IH]; intros specs mf H.
+  - exact H.
+  - cbn [engine_mergeX].
+    pose proof (mstepA_nz mf i (hd_error specs) H) as H1.
+    destruct (mstepA mf i (hd_error specs)) as [[[mf1 r] fl] x] eqn:EA.
+    cbn [fst] in H1.
+    specialize (IH (tl specs) mf1 H1).
+    destruct (engine_mergeX mf1 rest (tl specs))
+      as [[[mf2 rs] fls] xs] eqn:EB.
+    cbn [fst] in IH. cbn [fst]. exact IH.
+Qed.
+
+Lemma dumpS_nonzero :
+  forall m, smnz m -> Forall (fun p => snd p <> 0) (dumpS m).
+Proof.
+  intros m H. apply Forall_forall. intros [k v] Hin. cbn [snd].
+  apply (H k v). apply SM.elements_2. apply in_inA_S. exact Hin.
+Qed.
+
+Lemma dumpA_nonzero :
+  forall m, amnz m -> Forall (fun p => snd p <> 0) (dumpA m).
+Proof.
+  intros m H. apply Forall_forall. intros [a v] Hin. cbn [snd].
+  apply (H a v). apply AM.elements_2. apply in_inA_A. exact Hin.
+Qed.
+
+Theorem engine_dump_nonzero :
+  forall ts specs mf,
+    machnz mf ->
+    let mf' := fst (fst (engine_merge mf ts specs)) in
+    Forall (fun p => snd p <> 0) (dumpS (fst (fst mf')))
+    /\ Forall (fun p => snd p <> 0) (dumpA (snd (fst mf')))
+    /\ Forall (fun p => snd p <> 0) (dumpA (snd mf')).
+Proof.
+  intros ts specs mf H.
+  pose proof (engine_mergeX_nz ts specs mf H) as Hnz.
+  unfold engine_merge.
+  destruct (engine_mergeX mf ts specs) as [[[mf2 rs] fls] xs] eqn:EA.
+  cbn [fst] in Hnz. cbn [fst snd].
+  destruct Hnz as (H1 & H2 & H3).
+  refine (conj _ (conj _ _)).
+  - apply dumpS_nonzero. exact H1.
+  - apply dumpA_nonzero. exact H2.
+  - apply dumpA_nonzero. exact H3.
+Qed.
+
 (* __SENTINEL__ *)
 
 End Machine.
