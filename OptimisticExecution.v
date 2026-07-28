@@ -6473,6 +6473,251 @@ Proof.
           try rewrite EOM in Hlk2. cbn [fst] in Hlk2. exact Hlk2. }
 Qed.
 
+Lemma reach_inv :
+  forall ts m0 acts s,
+    oinv m0 ts s -> oinv m0 ts (fold_left (ostep ts) acts s).
+Proof.
+  intros ts m0 acts. induction acts as [| a acts' IH]; intros s Hs; cbn.
+  - exact Hs.
+  - apply IH. apply ostep_inv. exact Hs.
+Qed.
+
+Lemma oinit_inv : forall ts m0, oinv m0 ts (oinit m0).
+Proof.
+  intros ts m0.
+  split; [cbn; lia |]. split; [reflexivity |]. split; [reflexivity |].
+  split.
+  - intros j o vs H. discriminate.
+  - intros k i2 inc2 H. discriminate.
+Qed.
+
+(** Safety: however executions, validations, and commits interleave, once
+    the wavefront has crossed the block the committed machine and receipts
+    are sequential execution's. *)
+
+Theorem op_safety :
+  forall ts m0 acts,
+    os_c (reach ts (oinit m0) acts) = length ts ->
+    os_m (reach ts (oinit m0) acts) = fst (seq_execr m0 ts)
+    /\ os_rs (reach ts (oinit m0) acts) = snd (seq_execr m0 ts).
+Proof.
+  intros ts m0 acts Hdone.
+  pose proof (reach_inv ts m0 acts (oinit m0) (oinit_inv ts m0)) as Hs.
+  destruct Hs as [Hc [Hm [Hr _]]].
+  unfold reach in *.
+  rewrite Hdone in Hm, Hr.
+  split.
+  - rewrite Hm. apply mach_at_full.
+  - rewrite Hr. apply firstn_all2. rewrite seq_rcpt_len. lia.
+Qed.
+
+(** Liveness: a commit action always advances the wavefront, executions
+    and eager validations never retard it, so any schedule containing at
+    least as many commit actions as the block is long finishes the block,
+    whatever else it interleaves and in whatever order. *)
+
+Lemma commit_advances :
+  forall ts s,
+    os_c s < length ts ->
+    os_c (ostep ts s ACommit) = S (os_c s).
+Proof.
+  intros ts s Hlt. cbn [ostep].
+  destruct (os_c s <? length ts) eqn:Hb;
+    [| apply Nat.ltb_ge in Hb; lia].
+  destruct (nth_error ts (os_c s)) as [i |] eqn:Hi;
+    [| exfalso; apply nth_error_None in Hi; lia].
+  destruct (os_m s) as [[st bk] nm].
+  destruct i as [[[[fee non] t] g] p].
+  destruct (os_out s (os_c s)) as [[o vs] |].
+  - destruct (vercheck (o_slog o) vs (os_stamp s)
+              && bvalid bk (o_blog o) && nvalid nm (o_nlog o)
+              && gateb bk nm (fee, non, t, g, p)).
+    + destruct (finish st bk nm fee g p o) as [m1 r]. reflexivity.
+    + destruct (gateb bk nm (fee, non, t, g, p)).
+      * destruct (cstep (st, bk, nm) (fee, non, t, g, p) (Some o))
+          as [[m1 r] fl].
+        destruct fl; reflexivity.
+      * reflexivity.
+  - destruct (gateb bk nm (fee, non, t, g, p)).
+    + destruct (cstep (st, bk, nm) (fee, non, t, g, p) None)
+        as [[m1 r] fl].
+      reflexivity.
+    + reflexivity.
+Qed.
+
+Lemma exec_keeps :
+  forall ts s j, os_c (ostep ts s (AExec j)) = os_c s.
+Proof.
+  intros ts s j. cbn [ostep].
+  destruct ((os_c s <=? j) && (j <? length ts)); [| reflexivity].
+  destruct (nth_error ts j) as [i |]; reflexivity.
+Qed.
+
+Lemma aval_keeps :
+  forall ts s j, os_c (ostep ts s (AVal j)) = os_c s.
+Proof.
+  intros ts s j. cbn [ostep].
+  destruct ((os_c s <=? j) && (j <? length ts)); [| reflexivity].
+  destruct (os_out s j) as [[o vs] |]; [| reflexivity].
+  destruct (vercheck (o_slog o) vs (ostamp s j)); reflexivity.
+Qed.
+
+Definition is_commit (a : oact) : bool :=
+  match a with ACommit => true | _ => false end.
+
+Lemma osc_lower :
+  forall ts acts s,
+    Nat.min (length ts) (os_c s + length (filter is_commit acts))
+    <= os_c (fold_left (ostep ts) acts s).
+Proof.
+  intros ts acts. induction acts as [| a acts' IH]; intros s; cbn [fold_left].
+  - cbn [filter length]. lia.
+  - destruct a as [j | j |].
+    + cbn [filter is_commit].
+      etransitivity; [| apply IH].
+      rewrite exec_keeps. lia.
+    + cbn [filter is_commit].
+      etransitivity; [| apply IH].
+      rewrite aval_keeps. lia.
+    + cbn [filter is_commit length].
+      etransitivity; [| apply IH].
+      destruct (Nat.lt_ge_cases (os_c s) (length ts)) as [Hlt | Hge].
+      * rewrite commit_advances by exact Hlt. lia.
+      * assert (Hstay : os_c (ostep ts s ACommit) = os_c s).
+        { cbn [ostep]. destruct (os_c s <? length ts) eqn:Hb.
+          - apply Nat.ltb_lt in Hb. lia.
+          - reflexivity. }
+        rewrite Hstay. lia.
+Qed.
+
+Theorem op_liveness :
+  forall ts m0 acts,
+    length ts <= length (filter is_commit acts) ->
+    os_c (reach ts (oinit m0) acts) = length ts.
+Proof.
+  intros ts m0 acts Hn.
+  pose proof (osc_lower ts acts (oinit m0)) as Hlow.
+  pose proof (reach_inv ts m0 acts (oinit m0) (oinit_inv ts m0)) as [Hc _].
+  unfold reach in *. cbn [os_c oinit] in *.
+  lia.
+Qed.
+
+(** The commit-time re-execution count never exceeds the wavefront: each
+    position re-executes at most once, at its own commit. *)
+
+Lemma orx_step :
+  forall ts s a,
+    os_rx (ostep ts s a) + os_c s <= os_rx s + os_c (ostep ts s a).
+Proof.
+  intros ts s a. destruct a as [j | j |]; cbn [ostep].
+  - destruct ((os_c s <=? j) && (j <? length ts)); [| lia].
+    destruct (nth_error ts j) as [i |]; cbn; lia.
+  - destruct ((os_c s <=? j) && (j <? length ts)); [| lia].
+    destruct (os_out s j) as [[o vs] |]; [| lia].
+    destruct (vercheck (o_slog o) vs (ostamp s j)); cbn; lia.
+  - destruct (os_c s <? length ts); [| lia].
+    destruct (nth_error ts (os_c s)) as [i |]; [| lia].
+    destruct (os_m s) as [[st bk] nm].
+    destruct i as [[[[fee non] t] g] p].
+    destruct (os_out s (os_c s)) as [[o vs] |].
+    + destruct (vercheck (o_slog o) vs (os_stamp s)
+                && bvalid bk (o_blog o) && nvalid nm (o_nlog o)
+                && gateb bk nm (fee, non, t, g, p)).
+      * destruct (finish st bk nm fee g p o) as [m1 r]. cbn. lia.
+      * destruct (gateb bk nm (fee, non, t, g, p)).
+        -- destruct (cstep (st, bk, nm) (fee, non, t, g, p) (Some o))
+             as [[m1 r] fl].
+           destruct fl; cbn; lia.
+        -- cbn. lia.
+    + destruct (gateb bk nm (fee, non, t, g, p)).
+      * destruct (cstep (st, bk, nm) (fee, non, t, g, p) None)
+          as [[m1 r] fl].
+        cbn. lia.
+      * cbn. lia.
+Qed.
+
+Theorem op_reexec_bound :
+  forall ts m0 acts,
+    os_rx (reach ts (oinit m0) acts) <= os_c (reach ts (oinit m0) acts).
+Proof.
+  intros ts m0 acts. unfold reach.
+  assert (H : forall s, os_rx (fold_left (ostep ts) acts s) + os_c s
+                        <= os_rx s + os_c (fold_left (ostep ts) acts s)).
+  { induction acts as [| a acts' IH]; intros s; cbn [fold_left]; [lia |].
+    pose proof (orx_step ts s a).
+    pose proof (IH (ostep ts s a)). lia. }
+  pose proof (H (oinit m0)). cbn [os_rx os_c oinit] in *. lia.
+Qed.
+
+(** Fairness: if every window of [K] consecutive actions contains a
+    commit, the block finishes within [length ts * K] actions. *)
+
+Lemma firstn_plus :
+  forall (A : Type) n m (l : list A),
+    firstn (n + m) l = firstn n l ++ firstn m (skipn n l).
+Proof.
+  intros A n. induction n as [| n' IH]; intros m l;
+    cbn [firstn skipn Nat.add app].
+  - reflexivity.
+  - destruct l as [| x l'].
+    + rewrite ?skipn_nil, ?firstn_nil. reflexivity.
+    + cbn [firstn skipn app]. f_equal. apply IH.
+Qed.
+
+Lemma existsb_filter_le :
+  forall (A : Type) (f : A -> bool) l,
+    existsb f l = true -> 1 <= length (filter f l).
+Proof.
+  intros A f l. induction l as [| y r IH]; intros H; [discriminate |].
+  cbn [existsb] in H. apply orb_true_iff in H.
+  cbn [filter].
+  destruct H as [H | H].
+  - rewrite H. cbn. lia.
+  - destruct (f y); cbn; [lia | exact (IH H)].
+Qed.
+
+Lemma kdense_commits :
+  forall (K : nat) (acts : list oact),
+    1 <= K ->
+    (forall pre win post,
+        acts = pre ++ win ++ post -> length win = K ->
+        existsb is_commit win = true) ->
+    forall q, q * K <= length acts ->
+    q <= length (filter is_commit (firstn (q * K) acts)).
+Proof.
+  intros K acts HK Hd.
+  induction q as [| q' IH]; intros Hq; [lia |].
+  replace (S q' * K) with (q' * K + K) in Hq |- * by lia.
+  rewrite firstn_plus.
+  rewrite filter_app, length_app.
+  assert (Hwin : existsb is_commit (firstn K (skipn (q' * K) acts)) = true).
+  { apply (Hd (firstn (q' * K) acts)
+             (firstn K (skipn (q' * K) acts))
+             (skipn K (skipn (q' * K) acts))).
+    - rewrite (firstn_skipn K (skipn (q' * K) acts)).
+      rewrite (firstn_skipn (q' * K) acts).
+      reflexivity.
+    - apply firstn_length_le.
+      rewrite length_skipn. lia. }
+  pose proof (existsb_filter_le _ is_commit _ Hwin).
+  pose proof (IH ltac:(lia)).
+  lia.
+Qed.
+
+Theorem op_fair_completion :
+  forall ts m0 acts K,
+    1 <= K ->
+    (forall pre win post,
+        acts = pre ++ win ++ post -> length win = K ->
+        existsb is_commit win = true) ->
+    length ts * K <= length acts ->
+    os_c (reach ts (oinit m0) (firstn (length ts * K) acts)) = length ts.
+Proof.
+  intros ts m0 acts K HK Hd Hlen.
+  apply op_liveness.
+  pose proof (kdense_commits K acts HK Hd (length ts) Hlen). lia.
+Qed.
+
 (* __SENTINEL__ *)
 
 End Machine.
